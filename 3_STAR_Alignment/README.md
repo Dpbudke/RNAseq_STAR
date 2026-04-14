@@ -7,7 +7,7 @@ STAR-based read alignment to a reference genome, followed by read count matrix c
 ### `1_star_index.slurm`
 Builds the STAR genome index (run once per reference genome).
 
-- **Input:** Combined genome FASTA + GTF annotation
+- **Input:** GRCm39 genome FASTA + GENCODE M35 GTF annotation
 - **Output:** `References/star.overlap100.gencode.M35/` index directory
 - **Usage:**
   ```bash

@@ -19,11 +19,23 @@ Moves concatenated FASTQ pairs into per-sample subdirectories.
 
 - **Input:** `*_R1_concatenated.fastq.gz` / `*_R2_concatenated.fastq.gz` in current directory
 - **Output:** `<sample>/` directories each containing the R1 and R2 files
-- **Usage:** Run from the `concatenated_reads/` directory:
+- **Usage:**
   ```bash
   cd concatenated_reads
   bash ../2_organize_samples.sh
   ```
+
+> **After running:** move `2_organize_samples.sh` out of `concatenated_reads/` back to the base directory (e.g. `CCPups/`) before generating `samples.txt`, so the script filename doesn't appear as a sample name.
+
+### Generating `samples.txt`
+
+`samples.txt` (one sample name per line) is required by the HTStream and STAR SLURM array jobs. Generate it from inside `concatenated_reads/` after organizing:
+
+```bash
+cd concatenated_reads
+ls > ../samples.txt
+cat ../samples.txt   # verify contents look correct
+```
 
 ## Expected Output Structure
 
