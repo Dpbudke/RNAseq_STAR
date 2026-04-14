@@ -1,6 +1,6 @@
 # RNAseq_STAR
 
-RNA-seq preprocessing and differential expression analysis pipeline for Collaborative Cross (CC) mouse studies. This repository covers the full workflow from raw FASTQ concatenation through STAR alignment and downstream DE analysis.
+RNA-seq preprocessing, alignment, and differential expression analysis pipeline for Collaborative Cross (CC) and Diversity Outbred (DO) mouse studies. This repository covers the full workflow from raw FASTQ concatenation through STAR alignment and downstream DE analysis.
 
 ## Pipeline Overview
 
@@ -53,7 +53,7 @@ RNAseq_STAR/
 
 ## Study Context
 
-Scripts were developed for RNA-seq analysis of CC pup samples (~246 samples) studying diet effects on gene expression. Reference genome: combined CC multi-strain FASTA + annotation GTF.
+Scripts were developed for RNA-seq analysis of CC and CC-RIX pup samples (~246 samples) studying diet effects on gene expression. Reference genome: GRCm39
 
 ## Related Repository
 
