@@ -1,0 +1,1444 @@
+---
+title: "CCPups_DE_Analysis"
+output: html_document
+date: "2024-09-17"
+---
+
+**Load Packages**
+
+```{r}
+# Clear environment to start fresh (if necessary)
+rm(list = ls())
+
+library(openxlsx)
+library(BiocManager)
+library(edgeR)
+library(topGO)
+library(clusterProfiler)
+library(dplyr)
+library(Rgraphviz)
+library(org.Mm.eg.db)
+library(gplots)
+library(RColorBrewer)
+library(ggplot2)
+library(devtools)
+#devtools::install_github("javadnoorb/pathview")
+```
+
+**Read count table**
+
+```{r}
+counts <- read.delim("GRCm39_CCPups_redo_counts.txt", row.names = 1)
+
+#Note: R automatically added an X to the beginning of each of my numeric sample names, so I’m removing the X to have normal sample name (ex. 60C) – may introduce errors later on. 
+
+colnames(counts) <- sub("^X", "", colnames(counts))
+head(counts)
+```
+
+**Top Genes**
+
+```{r}
+# Calculate the total counts for each gene (row) by summing across all samples (columns)
+gene_sums <- rowSums(counts)
+
+# Order the rows by total counts from most to least
+counts_ordered <- counts[order(gene_sums, decreasing = TRUE), ]
+
+# View the top rows of the ordered table
+head(counts_ordered)
+
+#Top 5 genes: Albumin, Transferrin, ApoE, Mtco1 (cytochrome c oxidase subunit 1), and C3 (complement protein C3)
+```
+
+**Read in annotation**
+
+```{r}
+anno <- read.delim("ensembl_mm_112.txt",as.is=T)
+#dim(anno)
+```
+
+**Derive experiment metadata**
+
+```{r}
+#Note: I needed to create a custom code to import the cross/sex/maternal diet metadata. Also, I should only have 70 CC001/CC019/CC040 samples 
+
+# Load in Excel file and read the "ControlPups" sheet
+ControlPup <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", sheet = "ControlPups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Add Cross column 
+ControlPup$Cross <- paste0(ControlPup$CC.Mom.Strain, "x", ControlPup$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+ControlPup$Diet <- gsub("Low Protein", "LP", ControlPup$Diet)
+ControlPup$Diet <- gsub("AIN-93G", "AIN", ControlPup$Diet)
+
+# Select only the required columns
+metadata_subset <- ControlPup[, c("Animal.ID", "Sex", "Diet", "Cross")]
+
+# Get the sample names from the counts data
+sample_names <- colnames(counts)
+
+# Filter the metadata to include only the samples present in the counts data
+metadata_filtered <- metadata_subset %>%  filter(`Animal.ID` %in% sample_names)
+
+# Get the sample names from the metadata subset
+metadata_samples <- metadata_filtered$`Animal.ID`
+
+# Filter the counts data to only include the 70 CCPups samples
+sample_names <- as.character(metadata_samples)
+matching_columns <- intersect(sample_names, names(counts))
+counts_filtered <- counts[, matching_columns]
+
+# Ensure that the column names in counts_filtered match the Animal ID in metadata_filtered
+all_samples_present <- all(colnames(counts_filtered) %in% metadata_filtered$`Animal.ID`)
+
+# Verify that the order matches
+all(colnames(counts_filtered) == metadata_filtered$`Animal.ID`)
+
+# If the above returns TRUE, your metadata and counts are now correctly ordered and matched
+
+#Final files = counts_filtered and metadata_filtered
+```
+
+## Refining filterByExpr()
+
+```{r}
+# Create DGEList object and normalize
+d0 <- DGEList(counts_filtered)
+d0 <- calcNormFactors(d0)
+
+# Get metadata variables
+Cross = metadata_filtered$Cross
+Diet = metadata_filtered$Diet
+Sex = metadata_filtered$Sex
+
+# Create model matrix
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_filtered)
+
+
+# Function to analyze count distribution in a DGEList object
+analyze_dge_counts <- function(dge, design_matrix) {
+  # Extract raw counts
+  counts <- dge$counts
+  
+  # Basic statistics
+  stats <- data.frame(
+    Mean = mean(rowSums(counts)),
+    Median = median(rowSums(counts)),
+    Min = min(rowSums(counts)),
+    Q25 = quantile(rowSums(counts), 0.25),
+    Q75 = quantile(rowSums(counts), 0.75),
+    Max = max(rowSums(counts)),
+    Zeros = sum(rowSums(counts) == 0),
+    Below_10 = sum(rowSums(counts) < 10),
+    Below_15 = sum(rowSums(counts) < 15),
+    Below_25 = sum(rowSums(counts) < 25)
+  )
+  
+  # Calculate CPM
+  cpm <- edgeR::cpm(dge)
+  
+  # Create plots
+  par(mfrow=c(2,1))
+  
+  # Histogram of log2 raw counts
+  hist(log2(rowMeans(counts) + 1), 
+       breaks = 50,
+       main = "Distribution of log2(mean raw counts + 1)",
+       xlab = "log2(mean counts + 1)")
+  
+  # Histogram of log2 CPM
+  hist(log2(rowMeans(cpm) + 1), 
+       breaks = 50,
+       main = "Distribution of log2(mean CPM + 1)",
+       xlab = "log2(CPM + 1)")
+  
+  par(mfrow=c(1,1))
+  
+  # Try different filtering thresholds
+  thresholds <- list(
+    original = filterByExpr(dge, design_matrix),
+    moderate = filterByExpr(dge, design_matrix, min.count = 15, min.total.count = 25),
+    stringent = filterByExpr(dge, design_matrix, min.count = 30, min.total.count = 45),
+    very_stringent = filterByExpr(dge, design_matrix, min.count = 35, min.total.count = 55),
+    ultra_stringent = filterByExpr(dge, design_matrix, min.count = 40, min.total.count = 65),
+    super_stringent = filterByExpr(dge, design_matrix, min.count = 45, min.total.count = 75),
+    super_duper_stringent = filterByExpr(dge, design_matrix, min.count = 50, min.total.count = 85),
+    max_stringent = filterByExpr(dge, design_matrix, min.count = 60, min.total.count = 100) )
+  
+  # Count genes passing each threshold
+  genes_kept <- sapply(thresholds, sum)
+  
+  return(list(
+    basic_stats = stats,
+    filtering_results = genes_kept
+  ))
+}
+
+# Usage example:
+results <- analyze_dge_counts(d0, mm)
+print("Basic statistics:")
+print(results$basic_stats)
+print("\nNumber of genes kept with different thresholds:")
+print(results$filtering_results)
+```
+
+## All Control Pups MSD
+
+```{r}
+# Create DGEList object and normalize
+d0 <- DGEList(counts_filtered)
+d0 <- calcNormFactors(d0)
+
+# Get metadata variables
+Cross = metadata_filtered$Cross
+Diet = metadata_filtered$Diet
+Sex = metadata_filtered$Sex
+
+# Create model matrix
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_filtered)
+
+# Filter genes
+keep <- filterByExpr(d0, mm, min.count = 50, min.total.count = 85)
+sum(keep)
+d <- d0[keep,]
+
+# Define plotting function
+plotMDSWithLabels <- function(d, metadata_filtered, point_size=1, title="MDS Plot of RNA-seq Gene Expression") {
+  # Convert Cross to factor
+  metadata_filtered$Cross <- factor(metadata_filtered$Cross)
+  metadata_filtered$Sex <- factor(metadata_filtered$Sex)
+  
+  # Set up plotting margins with moderate space on right
+  par(mar=c(5,4,4,8))
+  
+  # Create the MDS plot
+  mds_plot <- plotMDS(d, 
+                      col = as.numeric(metadata_filtered$Cross),
+                      cex = point_size,
+                      main = title,
+                      xlab = "Leading logFC dim 1",
+                      ylab = "Leading logFC dim 2",
+                      plot = FALSE)
+  
+  # Define sex shapes
+  sex_shapes <- ifelse(metadata_filtered$Sex == "male", 16, 17)
+  
+  # Create the actual plot
+  plot(mds_plot$x, 
+       mds_plot$y,
+       col = as.numeric(metadata_filtered$Cross),
+       pch = sex_shapes,
+       cex = point_size,
+       main = title,
+       xlab = "Leading logFC dim 1",
+       ylab = "Leading logFC dim 2")
+  
+  # Add legend for crosses
+  legend("topright",
+         legend = levels(metadata_filtered$Cross),
+         col = 1:length(levels(metadata_filtered$Cross)),
+         pch = 16,
+         title = "Cross",
+         xpd = TRUE,
+         inset = c(-0.35, 0))
+  
+  # Add legend for sex
+  legend("bottomright",
+         legend = c("male", "female"),
+         pch = c(16, 17),
+         col = "black",
+         title = "Sex",
+         xpd = TRUE,
+         inset = c(-0.35, 0.2))
+}
+
+# Generate the plot
+plotMDSWithLabels(d, metadata_filtered)
+
+# Note: the more stringent I make my filtering, the better the MSD plots look - at least 01s and 19s cluster better
+# using "super_duper_stringent" filtering = 11266 genes 
+
+```
+
+**Filtering Metadata to check MSD Plots**
+
+```{r}
+# CC001
+
+metadata_filtered$group <- interaction(metadata_filtered$Cross, metadata_filtered$Sex)
+
+metadata_filtered_CC001 = subset(metadata_filtered, group %in% c("CC001xCC001.female", "CC001xCC001.male"))
+
+# Get the sample names from the metadata subset
+CC001_metadata_samples <- metadata_filtered_CC001$`Animal.ID`
+
+# Filter the counts data to only include desired samples
+CC001_counts_filtered <- counts_filtered %>%  select(all_of(CC001_metadata_samples))
+
+#Norm factors
+d0 <- DGEList(CC001_counts_filtered)
+d0 <- calcNormFactors(d0)
+
+#Write model
+group = metadata_filtered_CC001$group
+Diet = metadata_filtered_CC001$Diet
+mm <- model.matrix(~0 + group + Diet, data = metadata_filtered_CC001)
+head(mm)
+
+#Filtering genes
+#keep <- filterByExpr(d0, mm)
+keep <- filterByExpr(d0, mm, min.count = 50, min.total.count = 85)
+d <- d0[keep,]
+
+plotMDS(d, col = as.numeric(metadata_filtered_CC001$group), cex=1)
+
+#It doesn't look like the CC001 strain is clustering by anything. The color coding by group is by Sex, yet both males/female samples are dispersed sporatically (same with Diet) 
+```
+
+```{r}
+# CC019 
+
+metadata_filtered_CC019 = subset(metadata_filtered, group %in% c("CC019xCC019.female", "CC019xCC019.male"))
+
+# Get the sample names from the metadata subset
+CC019_metadata_samples <- metadata_filtered_CC019$`Animal.ID`
+
+# Filter the counts data to only include desired samples
+CC019_counts_filtered <- counts_filtered %>%  select(all_of(CC019_metadata_samples))
+
+#Norm factors
+d0 <- DGEList(CC019_counts_filtered)
+d0 <- calcNormFactors(d0)
+
+#Write model
+group = metadata_filtered_CC019$group
+Diet = metadata_filtered_CC019$Diet
+mm <- model.matrix(~0 + group + Diet, data = metadata_filtered_CC019)
+head(mm)
+
+#Filtering genes
+#keep <- filterByExpr(d0, mm)
+keep <- filterByExpr(d0, mm, min.count = 50, min.total.count = 85)
+d <- d0[keep,]
+
+#Plot MSD
+plotMDS(d, col = as.numeric(metadata_filtered_CC019$group), cex=1)
+
+#It doesn't look like the CC019 strain is clustering by anything. The color coding by group is by Sex, yet both males/female samples are dispersed sporatically (somewhat clusters with Diet) 
+```
+
+```{r}
+# CC040
+
+metadata_filtered_CC040 = subset(metadata_filtered, group %in% c("CC040xCC040.female", "CC040xCC040.male"))
+
+# Get the sample names from the metadata subset
+CC040_metadata_samples <- metadata_filtered_CC040$`Animal.ID`
+
+# Filter the counts data to only include desired samples
+CC040_counts_filtered <- counts %>%  select(all_of(CC040_metadata_samples))
+
+#Norm factors
+d0 <- DGEList(CC040_counts_filtered)
+d0 <- calcNormFactors(d0)
+
+#Write model
+group = metadata_filtered_CC040$group
+Diet = metadata_filtered_CC040$Diet
+mm <- model.matrix(~0 + group + Diet, data = metadata_filtered_CC040)
+head(mm)
+
+#Filtering genes
+keep <- filterByExpr(d0, mm)
+d <- d0[keep,]
+
+plotMDS(d, col = as.numeric(metadata_filtered_CC040$group), cex=1)
+
+#CC040 actually clustered clearly by Sex (also only strain that had significant sex DEGs), but this feels less conclusive considering there's only 2 males and 7 females 
+```
+
+```{r}
+
+# 2. Set up model matrix
+    Cross = metadata_subset$Cross
+    Sex = metadata_subset$Sex
+    mm <- model.matrix(~0 + Cross + Sex, data = metadata_subset)
+    
+    # Print model matrix structure
+    cat("\nModel matrix structure (first few rows):\n")
+    print(head(mm))
+    
+    # 3. DGE analysis pipeline
+    d0 <- DGEList(counts_subset)
+    d0 <- calcNormFactors(d0)
+    keep <- filterByExpr(d0, mm)
+    cat("\nNumber of genes retained:", sum(keep), "\n")
+    d <- d0[keep,]
+    logcpm <- cpm(d, prior.count=2, log=TRUE)
+    
+    # 4. Voom and model fitting
+    y <- voom(d, mm, plot = F)
+    fit <- lmFit(y, mm)
+    
+    # 5. Contrast and testing
+    cat("\nCoefficient names:\n")
+    print(colnames(coef(fit)))
+    
+    contr <- makeContrasts(CrossCC001xCC001 - CrossCC019xCC019, 
+                          levels = colnames(coef(fit)))
+    
+    cat("\nContrast structure:\n")
+    print(contr)
+    
+    tmp <- contrasts.fit(fit, contr)
+    tmp <- eBayes(tmp)
+    
+    # 6. Get results
+    top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+    deg_count <- sum(top.table$adj.P.Val < 0.05)
+    cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+    
+    # 7. Add gene annotations
+    top.table$Gene <- rownames(top.table)
+    top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+    top.table <- data.frame(top.table,
+                           anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                           logcpm[match(top.table$Gene,rownames(logcpm)),])
+    
+    
+# Option 1: If counts_filtered is a list with one element
+counts_filtered2 <- unlist(counts_filtered)
+hist(counts_filtered2, breaks=1000)
+
+# Option 2: If you need to extract specific elements
+# counts_filtered2 <- sapply(counts_filtered, function(x) x$value)  # If there's a 'value' element
+```
+
+### Gene-level QC
+
+```{r}
+# Function to calculate standard deviation and other QC metrics
+calc_gene_stats <- function(counts_df) {
+  # Calculate standard deviation for each gene
+  gene_sd <- apply(counts_df, 1, sd)
+  
+  # Calculate mean counts per gene
+  gene_means <- rowMeans(counts_df)
+  
+  # Calculate coefficient of variation (CV)
+  gene_cv <- gene_sd / gene_means
+  
+  # Create summary dataframe
+  gene_stats <- data.frame(
+    mean_counts = gene_means,
+    sd_counts = gene_sd,
+    cv = gene_cv,
+    zero_counts = rowSums(counts_df == 0)
+  )
+  
+  # Calculate summary statistics
+  summary_stats <- list(
+    sd_summary = summary(gene_sd),
+    mean_summary = summary(gene_means),
+    cv_summary = summary(gene_cv),
+    genes_with_zeros = sum(gene_stats$zero_counts > 0),
+    total_zeros = sum(gene_stats$zero_counts),
+    zero_sd_genes = sum(gene_sd == 0),
+    nonzero_sd_genes = sum(gene_sd > 0)
+  )
+  
+  return(list(gene_stats = gene_stats, summary_stats = summary_stats))
+}
+
+# Run the analysis
+qc_results <- calc_gene_stats(counts_filtered)
+
+# Create multiple visualizations
+library(ggplot2)
+library(gridExtra)
+
+# 1. Histogram of non-zero SDs
+p1 <- ggplot(data.frame(sd = qc_results$gene_stats$sd_counts[qc_results$gene_stats$sd_counts > 0]), 
+       aes(x = sd)) +
+  geom_histogram(bins = 100, fill = "steelblue", alpha = 0.7) +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(title = "Distribution of Standard Deviations Across Genes",
+       subtitle = paste("Excluding", qc_results$summary_stats$zero_sd_genes, "genes with SD = 0"),
+       x = "Standard Deviation of Read Counts (log10 scale)",
+       y = "Number of Genes")
+
+# 2. Boxplot of log-transformed non-zero SDs
+p2 <- ggplot(data.frame(sd = qc_results$gene_stats$sd_counts[qc_results$gene_stats$sd_counts > 0]), 
+       aes(y = sd)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(title = "Boxplot of Standard Deviations",
+       subtitle = "Non-zero SD values only",
+       x = "",
+       y = "Standard Deviation of Read Counts (log10 scale)")
+
+# Print summary information
+cat("Summary of Standard Deviations:\n")
+print(qc_results$summary_stats$sd_summary)
+cat("\nNumber of genes with zero SD:", qc_results$summary_stats$zero_sd_genes)
+cat("\nNumber of genes with non-zero SD:", qc_results$summary_stats$nonzero_sd_genes)
+
+# Display plots side by side
+grid.arrange(p1, p2, ncol = 2)
+```
+
+# Differential Gene Expression
+
+## Positive Control Contrasts: CC strain vs CC strain
+
+```{r}
+# CC001 vs CC019 Strain Comparison on AIN Diet
+
+analyze_strain_effect <- function(metadata_filtered, counts_filtered) {
+    
+    # 1. Subset to specific strains and diet
+    relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC001", "CC019xCC019") & 
+                       metadata_filtered$Diet == "AIN"
+    metadata_subset <- metadata_filtered[relevant_samples,]
+    counts_subset <- counts_filtered[,relevant_samples]
+    
+    # Verify subsetting
+    stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+    cat("\n=== Analysis for CC001 vs CC019 on AIN Diet ===\n")
+    cat("Total samples:", nrow(metadata_subset), "\n")
+    cat("Samples per strain:\n")
+    print(table(metadata_subset$Cross))
+    
+    # 2. Set up model matrix
+    Cross = metadata_subset$Cross
+    Sex = metadata_subset$Sex
+    mm <- model.matrix(~0 + Cross + Sex, data = metadata_subset)
+    
+    # Print model matrix structure
+    cat("\nModel matrix structure (first few rows):\n")
+    print(head(mm))
+    
+    # 3. DGE analysis pipeline
+    d0 <- DGEList(counts_subset)
+    d0 <- calcNormFactors(d0)
+    keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+    cat("\nNumber of genes retained:", sum(keep), "\n")
+    d <- d0[keep,]
+    logcpm <- cpm(d, prior.count=2, log=TRUE)
+    
+    # 4. Voom and model fitting
+    y <- voom(d, mm, plot = F)
+    fit <- lmFit(y, mm)
+    
+    # 5. Contrast and testing
+    cat("\nCoefficient names:\n")
+    print(colnames(coef(fit)))
+    
+    contr <- makeContrasts(CrossCC001xCC001 - CrossCC019xCC019, 
+                          levels = colnames(coef(fit)))
+    
+    cat("\nContrast structure:\n")
+    print(contr)
+    
+    tmp <- contrasts.fit(fit, contr)
+    tmp <- eBayes(tmp)
+    
+    # 6. Get results
+    top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+    deg_count <- sum(top.table$adj.P.Val < 0.05)
+    cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+    
+    # 7. Add gene annotations
+    top.table$Gene <- rownames(top.table)
+    top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+    top.table <- data.frame(top.table,
+                           anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                           logcpm[match(top.table$Gene,rownames(logcpm)),])
+    
+    return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run analysis
+results <- analyze_strain_effect(metadata_filtered, counts_filtered)
+
+# Optionally save results
+#write.table(results$results,
+#            file = "CC001_vs_CC019_AIN_strain_comparison.txt",
+#            row.names = F, sep = "\t", quote = F)
+
+# min.count=60, min.total.count=100: 3442 DEGs 
+# 4655 DEGs 
+# Before fixing normalization/filtering: 4380 FDR-adjusted DE
+```
+
+```{r}
+# CC001 vs CC019 Strain Comparison (Both Diets)
+
+analyze_strain_effect <- function(metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strains (including both diets)
+   relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC001", "CC019xCC019")
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for CC001 vs CC019 (Both Diets) ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Sample distribution:\n")
+   print(table(metadata_subset$Cross, metadata_subset$Diet))
+   
+   # 2. Set up model matrix
+   Cross = metadata_subset$Cross
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+  keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(CrossCC001xCC001 - CrossCC019xCC019, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run analysis
+results <- analyze_strain_effect(metadata_filtered, counts_filtered)
+
+# Optionally save results
+#write.table(results$results,
+#            file = "CC001_vs_CC019_both_diets_strain_comparison.txt",
+#            row.names = F, sep = "\t", quote = F)
+
+# min.count=60, min.total.count=100: 4375 DEGs
+# 5816 DEGs -- accounting for Diet effects
+```
+
+```{r}
+# CC001 vs CC040 Strain Comparison on AIN Diet
+
+analyze_strain_effect <- function(metadata_filtered, counts_filtered) {
+    
+    # 1. Subset to specific strains and diet
+    relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC001", "CC040xCC040") & 
+                       metadata_filtered$Diet == "AIN"
+    metadata_subset <- metadata_filtered[relevant_samples,]
+    counts_subset <- counts_filtered[,relevant_samples]
+    
+    # Verify subsetting
+    stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+    cat("\n=== Analysis for CC001 vs CC040 on AIN Diet ===\n")
+    cat("Total samples:", nrow(metadata_subset), "\n")
+    cat("Samples per strain:\n")
+    print(table(metadata_subset$Cross))
+    
+    # 2. Set up model matrix
+    Cross = metadata_subset$Cross
+    Sex = metadata_subset$Sex
+    mm <- model.matrix(~0 + Cross + Sex, data = metadata_subset)
+    
+    # Print model matrix structure
+    cat("\nModel matrix structure (first few rows):\n")
+    print(head(mm))
+    
+    # 3. DGE analysis pipeline
+    d0 <- DGEList(counts_subset)
+    d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+    cat("\nNumber of genes retained:", sum(keep), "\n")
+    d <- d0[keep,]
+    logcpm <- cpm(d, prior.count=2, log=TRUE)
+    
+    # 4. Voom and model fitting
+    y <- voom(d, mm, plot = F)
+    fit <- lmFit(y, mm)
+    
+    # 5. Contrast and testing
+    cat("\nCoefficient names:\n")
+    print(colnames(coef(fit)))
+    
+    contr <- makeContrasts(CrossCC001xCC001 - CrossCC040xCC040, 
+                          levels = colnames(coef(fit)))
+    
+    cat("\nContrast structure:\n")
+    print(contr)
+    
+    tmp <- contrasts.fit(fit, contr)
+    tmp <- eBayes(tmp)
+    
+    # 6. Get results
+    top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+    deg_count <- sum(top.table$adj.P.Val < 0.05)
+    cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+    
+    # 7. Add gene annotations
+    top.table$Gene <- rownames(top.table)
+    top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+    top.table <- data.frame(top.table,
+                           anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                           logcpm[match(top.table$Gene,rownames(logcpm)),])
+    
+    return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run analysis
+results <- analyze_strain_effect(metadata_filtered, counts_filtered)
+
+# Optionally save results
+#write.table(results$results,
+#            file = "CC001_vs_CC019_AIN_strain_comparison.txt",
+#            row.names = F, sep = "\t", quote = F)
+
+
+# min.count=60, min.total.count=100: 1 DEG 
+# 1 DEG -- surprising result 
+# Before fixing normalization/filtering: 638 FDR-adjusted DE
+```
+
+```{r}
+# CC001 vs CC040 Strain Comparison (Both Diets)
+
+analyze_strain_effect <- function(metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strains (including both diets)
+   relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC001", "CC040xCC040")
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for CC001 vs CC040 (Both Diets) ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Sample distribution:\n")
+   print(table(metadata_subset$Cross, metadata_subset$Diet))
+   
+   # 2. Set up model matrix
+   Cross = metadata_subset$Cross
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(CrossCC001xCC001 - CrossCC040xCC040, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run analysis
+results <- analyze_strain_effect(metadata_filtered, counts_filtered)
+
+# Optionally save results
+#write.table(results$results,
+#            file = "CC001_vs_CC019_both_diets_strain_comparison.txt",
+#            row.names = F, sep = "\t", quote = F)
+
+
+# min.count=60, min.total.count=100: 474 DEGs 
+# 785 DEGs -- accounting for Diet effects
+```
+
+```{r}
+# CC019 vs CC040 Strain Comparison on AIN Diet
+
+analyze_strain_effect <- function(metadata_filtered, counts_filtered) {
+    
+    # 1. Subset to specific strains and diet
+    relevant_samples <- metadata_filtered$Cross %in% c("CC019xCC019", "CC040xCC040") & 
+                       metadata_filtered$Diet == "AIN"
+    metadata_subset <- metadata_filtered[relevant_samples,]
+    counts_subset <- counts_filtered[,relevant_samples]
+    
+    # Verify subsetting
+    stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+    cat("\n=== Analysis for CC019 vs CC040 on AIN Diet ===\n")
+    cat("Total samples:", nrow(metadata_subset), "\n")
+    cat("Samples per strain:\n")
+    print(table(metadata_subset$Cross))
+    
+    # 2. Set up model matrix
+    Cross = metadata_subset$Cross
+    Sex = metadata_subset$Sex
+    mm <- model.matrix(~0 + Cross + Sex, data = metadata_subset)
+    
+    # Print model matrix structure
+    cat("\nModel matrix structure (first few rows):\n")
+    print(head(mm))
+    
+    # 3. DGE analysis pipeline
+    d0 <- DGEList(counts_subset)
+    d0 <- calcNormFactors(d0)
+    keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+    cat("\nNumber of genes retained:", sum(keep), "\n")
+    d <- d0[keep,]
+    logcpm <- cpm(d, prior.count=2, log=TRUE)
+    
+    # 4. Voom and model fitting
+    y <- voom(d, mm, plot = F)
+    fit <- lmFit(y, mm)
+    
+    # 5. Contrast and testing
+    cat("\nCoefficient names:\n")
+    print(colnames(coef(fit)))
+    
+    contr <- makeContrasts(CrossCC019xCC019 - CrossCC040xCC040, 
+                          levels = colnames(coef(fit)))
+    
+    cat("\nContrast structure:\n")
+    print(contr)
+    
+    tmp <- contrasts.fit(fit, contr)
+    tmp <- eBayes(tmp)
+    
+    # 6. Get results
+    top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+    deg_count <- sum(top.table$adj.P.Val < 0.05)
+    cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+    
+    # 7. Add gene annotations
+    top.table$Gene <- rownames(top.table)
+    top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+    top.table <- data.frame(top.table,
+                           anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                           logcpm[match(top.table$Gene,rownames(logcpm)),])
+    
+    return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run analysis
+results <- analyze_strain_effect(metadata_filtered, counts_filtered)
+
+# Optionally save results
+#write.table(results$results,
+#            file = "CC001_vs_CC019_AIN_strain_comparison.txt",
+#            row.names = F, sep = "\t", quote = F)
+
+
+# min.count=60, min.total.count=100: 1636 DEGs 
+# 2232 DEGs 
+# Before fixing normalization/filtering: 2345 FDR-adjusted DE
+```
+
+```{r}
+# CC019 vs CC040 Strain Comparison (Both Diets)
+
+analyze_strain_effect <- function(metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strains (including both diets)
+   relevant_samples <- metadata_filtered$Cross %in% c("CC019xCC019", "CC040xCC040")
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for CC019 vs CC040 (Both Diets) ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Sample distribution:\n")
+   print(table(metadata_subset$Cross, metadata_subset$Diet))
+   
+   # 2. Set up model matrix
+   Cross = metadata_subset$Cross
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(CrossCC019xCC019 - CrossCC040xCC040, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run analysis
+results <- analyze_strain_effect(metadata_filtered, counts_filtered)
+
+# Optionally save results
+#write.table(results$results,
+#            file = "CC001_vs_CC019_both_diets_strain_comparison.txt",
+#            row.names = F, sep = "\t", quote = F)
+
+
+# min.count=60, min.total.count=100: 477 DEGs 
+# 830 DEGs -- accounting for Diet effects
+```
+
+## Diet Effects
+
+```{r}
+# Diet effect on all 3 CC strains combined 
+
+analyze_diet_effect_combined <- function(strains, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specified strains
+   relevant_samples <- metadata_filtered$Cross %in% strains
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for Combined Strains Diet Effect ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per strain and diet:\n")
+   print(table(metadata_subset$Cross, metadata_subset$Diet))
+   
+   # 2. Set up model matrix - now including Strain
+   Diet <- metadata_subset$Diet
+   Sex <- metadata_subset$Sex
+   Strain <- factor(metadata_subset$Cross)
+   mm <- model.matrix(~0 + Diet + Strain + Sex, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, large.n = 8)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   # Create contrast for diet effect across all strains
+   contr <- makeContrasts(DietAIN - DietLP,
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Run combined analysis
+strains <- c("CC001xCC001", "CC019xCC019", "CC040xCC040")
+combined_results <- analyze_diet_effect_combined(strains, metadata_filtered, counts_filtered)
+
+# Print results
+cat("\n=== Results of Combined Diet Effect Analysis ===\n")
+cat(sprintf("Total DEGs across all strains: %d\n", combined_results$DEGs))
+
+# Adj.P.val of 0.993 ... 
+```
+
+```{r}
+# Diet Effect Analysis for Each Strain
+
+analyze_diet_effect <- function(strain, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strain
+   relevant_samples <- metadata_filtered$Cross == strain
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for", strain, "Diet Effect ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per diet:\n")
+   print(table(metadata_subset$Diet))
+   
+   # 2. Set up model matrix
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Diet + Sex, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, large.n =8) 
+  #keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(DietAIN - DietLP, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Define strains to analyze
+strains <- c("CC001xCC001", "CC019xCC019", "CC040xCC040")
+
+# Run analysis for each strain
+all_results <- list()
+for(strain in strains) {
+   all_results[[strain]] <- analyze_diet_effect(strain, metadata_filtered, counts_filtered)
+}
+
+# Print summary of all results
+cat("\n=== Summary of Diet Effects by Strain ===\n")
+for(strain in strains) {
+   cat(sprintf("%s: %d DEGs\n", strain, all_results[[strain]]$DEGs))
+}
+
+# Optionally save detailed results for each strain
+#for(strain in strains) {
+#    write.table(all_results[[strain]]$results,
+#                file = paste0("Diet_effect_", strain, ".txt"),
+#                row.names = F, sep = "\t", quote = F)
+#}
+
+
+# min.count=60, min.total.count=100: 0 DEGs for all 3
+# 0 DEGs for all 3
+```
+
+## Sex Effects
+
+```{r}
+# Sex Effect Analysis for Each Strain
+
+analyze_sex_effect <- function(strain, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strain
+   relevant_samples <- metadata_filtered$Cross == strain
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for", strain, "Sex Effect ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per sex:\n")
+   print(table(metadata_subset$Sex))
+   
+   # 2. Set up model matrix
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Sex + Diet, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+    keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+  logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(Sexmale - Sexfemale, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Define strains to analyze
+strains <- c("CC001xCC001", "CC019xCC019", "CC040xCC040")
+
+# Run analysis for each strain
+all_results <- list()
+for(strain in strains) {
+   all_results[[strain]] <- analyze_sex_effect(strain, metadata_filtered, counts_filtered)
+}
+
+# Print summary of all results
+cat("\n=== Summary of Sex Effects by Strain ===\n")
+for(strain in strains) {
+   cat(sprintf("%s: %d DEGs\n", strain, all_results[[strain]]$DEGs))
+}
+
+# Optionally save detailed results for each strain
+#for(strain in strains) {
+#    write.table(all_results[[strain]]$results,
+#                file = paste0("Sex_effect_", strain, ".txt"),
+#                row.names = F, sep = "\t", quote = F)
+#}
+
+
+# min.count=60, min.total.count=100:
+#CC001xCC001: 0 DEGs
+#CC019xCC019: 0 DEGs
+#CC040xCC040: 3 DEGs
+
+#CC001xCC001: 0 DEGs
+#CC019xCC019: 0 DEGs
+#CC040xCC040: 2 DEGs
+```
+
+### Diet effect for each Strain/Sex combo
+
+```{r}
+# Diet Effect Analysis for Each Strain and Sex Combination
+
+analyze_diet_effect_by_sex <- function(strain, sex, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strain and sex
+   relevant_samples <- metadata_filtered$Cross == strain & 
+                      metadata_filtered$Sex == sex
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat(sprintf("\n=== Analysis for %s, %s Only ===\n", strain, sex))
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per diet:\n")
+   print(table(metadata_subset$Diet))
+   
+   # 2. Set up model matrix (no Sex term needed since already stratified)
+   Diet = metadata_subset$Diet
+   mm <- model.matrix(~0 + Diet, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(DietAIN - DietLP, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Define strains and sexes
+strains <- c("CC001xCC001", "CC019xCC019", "CC040xCC040")
+sexes <- c("male", "female")
+
+# Run analysis for each strain-sex combination
+all_results <- list()
+for(strain in strains) {
+   all_results[[strain]] <- list()
+   for(sex in sexes) {
+       all_results[[strain]][[sex]] <- analyze_diet_effect_by_sex(strain, sex, 
+                                                                 metadata_filtered, 
+                                                                 counts_filtered)
+   }
+}
+
+# Print summary of all results
+cat("\n=== Summary of Diet Effects by Strain and Sex ===\n")
+for(strain in strains) {
+   cat(sprintf("\n%s:\n", strain))
+   for(sex in sexes) {
+       cat(sprintf("  %s: %d DEGs\n", sex, all_results[[strain]][[sex]]$DEGs))
+   }
+}
+
+# Optionally save detailed results for each strain-sex combination
+#for(strain in strains) {
+#    for(sex in sexes) {
+#        write.table(all_results[[strain]][[sex]]$results,
+#                    file = paste0("Diet_effect_", strain, "_", sex, ".txt"),
+#                    row.names = F, sep = "\t", quote = F)
+#    }
+#}
+
+#Note not enough samples to assess the CC040s
+
+# min.count=60, min.total.count=100: 0 DEGs for both M/F for both 01 and 19
+# 0 DEGs for both M/F for both 01 and 19
+```
+
+**How many DE genes (Qvalue)?**
+
+```{r}
+library(qvalue)
+
+# Estimate contrast for each gene
+#tmp <- contrasts.fit(fit, contr)
+
+# Compute empirical Bayes statistics
+# Some genes will have increased or decreased variance that is not a result of low expression, but due to other random factors. We are going to run empirical Bayes to adjust the variance of these genes.
+tmp <- eBayes(tmp)
+
+# Get the top differentially expressed genes 
+top.table <- topTable(tmp, adjust.method = "none", sort.by = "P", n = Inf)
+
+# Extract p-values
+pvalues <- top.table$P.Value 
+
+# Calculate q-values
+qobj <- qvalue(p = pvalues)
+
+# Add q-values to the top.table
+top.table$q.value <- qobj$qvalues
+
+# How many adjusted DE genes? 
+length(which(top.table$q.value  < 0.05))
+
+# How many unadjusted DE genes?
+length(which(top.table$P.Value < 0.05))
+```
+
+## Enrichment (Diet)
+
+**GO: create a topGOdata object**
+
+```{r}
+infile <- "AllPups_AIN_v_LP.txt"
+DE <- read.delim(infile)
+
+colnames(DE) <- sub("^X", "", colnames(DE))
+#head(DE)
+
+# Add entrezgene IDs to top table
+tmp <- bitr(DE$Gene.stable.ID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+id.conv <- subset(tmp, !duplicated(tmp$ENSEMBL))
+DE <- left_join(DE, id.conv, by = c("Gene.stable.ID" = "ENSEMBL"))
+
+# Make gene list
+DE.nodupENTREZ <- subset(DE, !is.na(ENTREZID) & !duplicated(ENTREZID))
+geneList <- DE.nodupENTREZ$P.Value
+names(geneList) <- DE.nodupENTREZ$ENTREZID
+head(geneList)
+
+# Create topGOData object
+GOdata <- new("topGOdata",
+	ontology = "BP",
+	allGenes = geneList,
+	geneSelectionFun = function(x)x,
+	annot = annFUN.org , mapping = "org.Mm.eg.db")
+```
+
+**The topGOdata object is then used as input for enrichment testing:**
+
+```{r}
+# Kolmogorov-Smirnov testing
+resultKS <- runTest(GOdata, algorithm = "weight01", statistic = "ks")
+tab <- GenTable(GOdata, raw.p.value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+head(tab, 15)
+```
+
+We can use the function showSigOfNodes to plot the GO graph for the 2 most significant terms and their parents, color coded by enrichment p-value (red is most significant):
+
+```{r, fig.width = 20, fig.height = 20}
+par(cex = 0.3)
+showSigOfNodes(GOdata, score(resultKS), firstSigNodes = 2, useInfo = "def", .NO.CHAR = 40)
+par(cex = 1)
+```
+
+**KEGG**
+
+```{r}
+
+```

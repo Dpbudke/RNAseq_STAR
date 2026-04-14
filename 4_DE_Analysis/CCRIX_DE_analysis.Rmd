@@ -1,0 +1,1925 @@
+---
+title: "CCRIX_DE_analysis"
+output: html_document
+date: "2024-09-20"
+---
+
+Note: this was a "cleaned" version with just the removal of the RIX1 outlier samples 120, 63, and 18, but that doesn't warrant a whole new notebook. Just unhash the "counts_filter_no_outliers" and "metadata_filtered_no_outliers" code in Metadata chunk.
+
+120 = low counts (16M total)
+
+63 = low counts (18M total)
+
+18 = looked like outlier on WGCNA?
+
+120/63 are both still \>10M, plus I'm doing logcmp normalization, so I don't think excluding these helps
+
+# **1. Load Packages**
+
+```{r}
+# Clear environment to start fresh (if necessary)
+rm(list = ls())
+
+library(openxlsx)
+library(BiocManager)
+library(edgeR)
+library(topGO)
+library(clusterProfiler)
+library(dplyr)
+library(Rgraphviz)
+library(org.Mm.eg.db)
+library(gplots)
+library(RColorBrewer)
+library(ggplot2)
+library(scales)
+library(devtools)
+#devtools::install_github("javadnoorb/pathview")
+library(pathview)
+library(enrichplot)
+```
+
+# **2. Read count table**
+
+```{r}
+counts <- read.delim("GRCm39_CCPups_redo_counts.txt", row.names = 1)
+
+#Note: R automatically added an X to the beginning of each of my numeric sample names, so I’m removing the X to have normal sample name (ex. 60C) – may introduce errors later on. 
+
+colnames(counts) <- sub("^X", "", colnames(counts))
+head(counts)
+```
+
+**QC: Top Genes**
+
+```{r}
+# Calculate the total counts for each gene (row) by summing across all samples (columns)
+gene_sums <- rowSums(counts)
+
+# Order the rows by total counts from most to least
+counts_ordered <- counts[order(gene_sums, decreasing = TRUE), ]
+
+# View the top rows of the ordered table
+head(counts_ordered)
+
+#Top 5 genes: Albumin, Transferrin, ApoE, Mtco1 (cytochrome c oxidase subunit 1), and C3 (complement protein C3)
+```
+
+# **3. Read in annotation**
+
+```{r}
+anno <- read.delim("ensembl_mm_112.txt",as.is=T)
+```
+
+# **4. Derive experiment metadata**
+
+```{r}
+#Note: I needed to create a custom code to import the cross/sex/maternal diet metadata. Also, I should have 176 CCRIX samples 
+
+# Load in Excel file and read the "pups" sheet
+pup <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", sheet = "Pups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Add Cross column 
+pup$Cross <- paste0(pup$CC.Mom.Strain, "x", pup$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+pup$Diet <- gsub("Low Protein", "LP", pup$Diet)
+pup$Diet <- gsub("AIN-93G", "AIN", pup$Diet)
+
+# Select only the required columns
+metadata_subset <- pup[, c("Animal.ID", "Sex", "Diet", "Cross")]
+
+# Get the sample names from the counts data
+sample_names <- colnames(counts)
+
+# Filter the metadata to include only the samples present in the counts data
+metadata_filtered <- metadata_subset %>%  filter(`Animal.ID` %in% sample_names)
+
+# Get the sample names from the metadata subset
+metadata_samples <- metadata_filtered$`Animal.ID`
+
+# Filter the counts data to only include the CCRIX samples
+sample_names <- as.character(metadata_samples)
+matching_columns <- intersect(sample_names, names(counts))
+counts_filtered <- counts[, matching_columns]
+
+# Ensure that the column names in counts_filtered match the Animal ID in metadata_filtered
+all_samples_present <- all(colnames(counts_filtered) %in% metadata_filtered$`Animal.ID`)
+
+# Verify that the order matches
+all(colnames(counts_filtered) == metadata_filtered$`Animal.ID`)
+
+# If the above returns TRUE, your metadata and counts are now correctly ordered and matched
+
+
+#### Outliers 
+# Exclude outlier samples (120, 63, and 18) from metadata
+#metadata_filtered_no_outliers <- metadata_filtered %>% 
+  #filter(!`Animal.ID` %in% c("120", "63", "18"))
+
+# Exclude outlier samples (120, 63, and 18) from counts
+#counts_filtered_no_outliers <- counts_filtered %>% 
+  #select(-c("120", "63", "18"))
+
+# Verify that the outliers have been removed and the order still matches
+all(colnames(counts_filtered) == metadata_filtered$`Animal.ID`)
+
+# Final files = counts_filtered and metadata_filtered
+# Final files = counts_filtered_no_outliers and metadata_filtered_no_outliers
+```
+
+**QC: Refining filterByExpr()**
+
+```{r}
+# Create DGEList object and normalize
+d0 <- DGEList(counts_filtered)
+d0 <- calcNormFactors(d0)
+
+# Get metadata variables
+Cross = metadata_filtered$Cross
+Diet = metadata_filtered$Diet
+Sex = metadata_filtered$Sex
+
+# Create model matrix
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_filtered)
+
+
+# Function to analyze count distribution in a DGEList object
+analyze_dge_counts <- function(dge, design_matrix) {
+  # Extract raw counts
+  counts <- dge$counts
+  
+  # Basic statistics
+  stats <- data.frame(
+    Mean = mean(rowSums(counts)),
+    Median = median(rowSums(counts)),
+    Min = min(rowSums(counts)),
+    Q25 = quantile(rowSums(counts), 0.25),
+    Q75 = quantile(rowSums(counts), 0.75),
+    Max = max(rowSums(counts)),
+    Zeros = sum(rowSums(counts) == 0),
+    Below_10 = sum(rowSums(counts) < 10),
+    Below_15 = sum(rowSums(counts) < 15),
+    Below_25 = sum(rowSums(counts) < 25)
+  )
+  
+  # Calculate CPM
+  cpm <- edgeR::cpm(dge)
+  
+  # Create plots
+  par(mfrow=c(2,1))
+  
+  # Histogram of log2 raw counts
+  hist(log2(rowMeans(counts) + 1), 
+       breaks = 50,
+       main = "Distribution of log2(mean raw counts + 1)",
+       xlab = "log2(mean counts + 1)")
+  
+  # Histogram of log2 CPM
+  hist(log2(rowMeans(cpm) + 1), 
+       breaks = 50,
+       main = "Distribution of log2(mean CPM + 1)",
+       xlab = "log2(CPM + 1)")
+  
+  par(mfrow=c(1,1))
+  
+  # Try different filtering thresholds
+  thresholds <- list(
+    original = filterByExpr(dge, design_matrix),
+    moderate = filterByExpr(dge, design_matrix, min.count = 15, min.total.count = 25),
+    stringent = filterByExpr(dge, design_matrix, min.count = 30, min.total.count = 45),
+    very_stringent = filterByExpr(dge, design_matrix, min.count = 35, min.total.count = 55),
+    ultra_stringent = filterByExpr(dge, design_matrix, min.count = 40, min.total.count = 65),
+    super_stringent = filterByExpr(dge, design_matrix, min.count = 45, min.total.count = 75),
+    super_duper_stringent = filterByExpr(dge, design_matrix, min.count = 50, min.total.count = 85),
+    max_stringent = filterByExpr(dge, design_matrix, min.count = 60, min.total.count = 100)
+     )
+  
+  # Count genes passing each threshold
+  genes_kept <- sapply(thresholds, sum)
+  
+  return(list(
+    basic_stats = stats,
+    filtering_results = genes_kept
+  ))
+}
+
+# Usage example:
+results <- analyze_dge_counts(d0, mm)
+print("Basic statistics:")
+print(results$basic_stats)
+print("\nNumber of genes kept with different thresholds:")
+print(results$filtering_results)
+```
+
+**QC: All CCRIX Multidimensional scaling (MDS) plot**
+
+```{r}
+# Create DGEList object and normalize
+d0 <- DGEList(counts_filtered)
+d0 <- calcNormFactors(d0)
+
+# Get metadata variables
+Cross = metadata_filtered$Cross
+Diet = metadata_filtered$Diet
+Sex = metadata_filtered$Sex
+
+# Create model matrix
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_filtered)
+
+# Filter genes
+keep <- filterByExpr(d0, mm)
+#keep <- filterByExpr(d0, mm, min.count = 50, min.total.count = 85)
+sum(keep)
+d <- d0[keep,]
+
+# Define plotting function
+plotMDSWithLabels <- function(d, metadata_filtered, point_size=1, title="MDS Plot of RNA-seq Gene Expression") {
+  # Convert Cross to factor
+  metadata_filtered$Cross <- factor(metadata_filtered$Cross)
+  metadata_filtered$Sex <- factor(metadata_filtered$Sex)
+  
+  # Set up plotting margins with moderate space on right
+  par(mar=c(5,4,4,8))
+  
+  # Create the MDS plot
+  mds_plot <- plotMDS(d, 
+                      col = as.numeric(metadata_filtered$Cross),
+                      cex = point_size,
+                      main = title,
+                      xlab = "Leading logFC dim 1",
+                      ylab = "Leading logFC dim 2",
+                      plot = FALSE)
+  
+  # Define sex shapes
+  sex_shapes <- ifelse(metadata_filtered$Sex == "male", 16, 17)
+  
+  # Create the actual plot
+  plot(mds_plot$x, 
+       mds_plot$y,
+       col = as.numeric(metadata_filtered$Cross),
+       pch = sex_shapes,
+       cex = point_size,
+       main = title,
+       xlab = "Leading logFC dim 1",
+       ylab = "Leading logFC dim 2")
+  
+  # Add legend for crosses
+  legend("topright",
+         legend = levels(metadata_filtered$Cross),
+         col = 1:length(levels(metadata_filtered$Cross)),
+         pch = 16,
+         title = "Cross",
+         xpd = TRUE,
+         inset = c(-0.35, 0))
+  
+  # Add legend for sex
+  legend("bottomright",
+         legend = c("male", "female"),
+         pch = c(16, 17),
+         col = "black",
+         title = "Sex",
+         xpd = TRUE,
+         inset = c(-0.35, 0.2))
+}
+
+# Generate the plot
+plotMDSWithLabels(d, metadata_filtered)
+
+# using "super_duper_stringent" filtering = 11320 genes 
+
+# cant identify outlier since groups are not clustered 
+```
+
+**QC: Filtering Metadata to check MDS Plots**
+
+```{r}
+# CC001xCC019 
+# Checking sample 18 (01x19) that looks like outlier 
+#Note: MDS doesn't cluster by the Cross, so it's impossible to tell if 18 is an "outlier" since the samples don't group together at all 
+
+metadata_filtered_01x19 = subset(metadata_filtered, Cross %in% c("CC001xCC019", "CC019xCC001"))
+
+# Get the sample names from the metadata subset
+CC_01x19_metadata_samples <- as.character(metadata_filtered_01x19$`Animal.ID`)
+
+# Filter the counts data to only include desired samples
+CC_01x19_counts_filtered <- counts %>%  select(all_of(CC_01x19_metadata_samples))
+
+#Norm factors
+d0 <- DGEList(CC_01x19_counts_filtered)
+d0 <- calcNormFactors(d0)
+
+#Write model
+Cross = metadata_filtered_01x19$Cross
+Diet = metadata_filtered_01x19$Diet
+Sex = metadata_filtered_01x19$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_filtered_01x19)
+
+#Filtering genes
+keep <- filterByExpr(d0, mm)
+d <- d0[keep,]
+
+plotMDS(d, col = as.numeric(metadata_filtered_01x19$Cross), cex=1)
+
+# Find the index of sample "18"
+sample_18_index <- which(colnames(d) == "18")
+
+# If sample "18" exists, highlight it
+if (length(sample_18_index) > 0) {
+  # Get the coordinates of sample "18"
+  mds_coords <- plotMDS(d, plot=FALSE)
+  x_18 <- mds_coords$x[sample_18_index]
+  y_18 <- mds_coords$y[sample_18_index]
+  
+  # Add a point for sample "18" with a different color and shape
+  points(x_18, y_18, col="red", pch=19, cex=2)
+  
+  # Add a label for sample "18"
+  text(x_18, y_18, labels="18", pos=3, col="red", cex=1.2)
+} else {
+  cat("Sample '18' not found in the dataset.\n")
+}
+
+# Add a legend
+legend("topright", legend=c("Other samples", "Sample 18"), 
+       col=c("black", "red"), pch=c(1, 19), cex=0.8)
+```
+
+**QC: Gene-level QC**
+
+```{r}
+# Function to calculate standard deviation and other QC metrics
+calc_gene_stats <- function(counts_df) {
+  # Calculate standard deviation for each gene
+  gene_sd <- apply(counts_df, 1, sd)
+  
+  # Calculate mean counts per gene
+  gene_means <- rowMeans(counts_df)
+  
+  # Calculate coefficient of variation (CV)
+  gene_cv <- gene_sd / gene_means
+  
+  # Create summary dataframe
+  gene_stats <- data.frame(
+    mean_counts = gene_means,
+    sd_counts = gene_sd,
+    cv = gene_cv,
+    zero_counts = rowSums(counts_df == 0)
+  )
+  
+  # Calculate summary statistics
+  summary_stats <- list(
+    sd_summary = summary(gene_sd),
+    mean_summary = summary(gene_means),
+    cv_summary = summary(gene_cv),
+    genes_with_zeros = sum(gene_stats$zero_counts > 0),
+    total_zeros = sum(gene_stats$zero_counts),
+    zero_sd_genes = sum(gene_sd == 0),
+    nonzero_sd_genes = sum(gene_sd > 0)
+  )
+  
+  return(list(gene_stats = gene_stats, summary_stats = summary_stats))
+}
+
+# Run the analysis
+qc_results <- calc_gene_stats(counts_filtered)
+
+# Create multiple visualizations
+library(ggplot2)
+library(gridExtra)
+
+# Create better binned histogram with improved readability
+p1 <- ggplot(data.frame(sd = qc_results$gene_stats$sd_counts[qc_results$gene_stats$sd_counts > 0]), 
+       aes(x = sd)) +
+  geom_histogram(breaks = c(0, 0.1, 1, 10, 100, 1000, max(qc_results$gene_stats$sd_counts)),
+                 fill = "steelblue", 
+                 alpha = 0.7) +
+  scale_x_log10(
+    breaks = c(0.1, 1, 10, 100, 1000, 10000),
+    labels = scales::comma,
+    limits = c(0.1, max(qc_results$gene_stats$sd_counts))
+  ) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    labels = scales::comma
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(title = "Distribution of Standard Deviations Across Genes",
+       subtitle = paste("Excluding", sum(qc_results$gene_stats$sd_counts == 0), "genes with SD = 0"),
+       x = "Standard Deviation of Read Counts (log10 scale)",
+       y = "Number of Genes")
+
+# Print summary information
+cat("Summary of Standard Deviations:\n")
+print(qc_results$summary_stats$sd_summary)
+cat("\nNumber of genes with zero SD:", qc_results$summary_stats$zero_sd_genes)
+cat("\nNumber of genes with non-zero SD:", qc_results$summary_stats$nonzero_sd_genes)
+
+print(p1)
+```
+
+# 5. Differential Gene Expression
+
+## A. RIX vs RIX (POE)
+
+```{r}
+# RIX1 
+# CC001xCC019 RIX 
+
+# 1. Subset data and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC019", "CC019xCC001")
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify sample alignment and print summary
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Number of samples in analysis:", nrow(metadata_subset), "\n")
+print(table(metadata_subset$Cross)) # Check sample sizes per cross
+
+# 2. Proceed with analysis
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n =8) 
+#keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+cat("\nNumber of genes retained:", sum(keep), "\n")
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC001xCC019 - CrossCC019xCC001, levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 4. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+#write.table(top.table, file = "Data/2_3_25/RIX1_DEGs.txt", row.names = F, sep = "\t", quote = F)
+
+# 5. Print summary of results
+cat("Number of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+# min.count=60, min.total.count=100: 0 DEGs
+# 0 DEGs - Very confused by this result -- ie still 0
+```
+
+```{r}
+# RIX1 
+# CC001xCC019 RIX (Males Only)
+
+# 1. Initial sex-specific subsetting and verification
+metadata_males <- metadata_filtered %>% 
+    filter(Sex == "male")
+male_ids <- as.character(metadata_males$Animal.ID)
+counts_males <- counts_filtered[, male_ids]
+
+# Verify sex-specific subsetting
+stopifnot(all(colnames(counts_males) == metadata_males$Animal.ID))
+cat("Number of male samples in metadata:", nrow(metadata_males), "\n")
+cat("Number of male samples in counts:", ncol(counts_males), "\n")
+
+# 2. Further subset to specific crosses
+relevant_samples <- metadata_males$Cross %in% c("CC001xCC019", "CC019xCC001")
+metadata_subset <- metadata_males[relevant_samples,]
+counts_subset <- counts_males[,relevant_samples]
+
+# Verify cross-specific subsetting
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+
+# 3. Set up model matrix (note: Sex removed since all male)
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+mm <- model.matrix(~0 + Cross + Diet, data = metadata_subset)
+
+# 4. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n =8) 
+#keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+cat("\nNumber of genes retained:", sum(keep), "\n")
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC001xCC019 - CrossCC019xCC001, 
+                      levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 5. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,
+                       anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+#write.table(top.table, file = "Data/M_RIX1_DEGs.txt", 
+         #   row.names = F, sep = "\t", quote = F)
+
+# 6. Print summary of results
+cat("\nNumber of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+# min.count=60, min.total.count=100: 0 DEGs
+# 0 DEGs - not even close to significance 
+```
+
+```{r}
+# RIX1 
+# CC001xCC019 RIX (Females Only)
+
+# 1. Initial sex-specific subsetting and verification
+metadata_females <- metadata_filtered %>% 
+    filter(Sex == "female")
+female_ids <- as.character(metadata_females$Animal.ID)
+counts_females <- counts_filtered[, female_ids]
+
+# Verify sex-specific subsetting
+stopifnot(all(colnames(counts_females) == metadata_females$Animal.ID))
+cat("Number of female samples in metadata:", nrow(metadata_females), "\n")
+cat("Number of female samples in counts:", ncol(counts_females), "\n")
+
+# 2. Further subset to specific crosses
+relevant_samples <- metadata_females$Cross %in% c("CC001xCC019", "CC019xCC001")
+metadata_subset <- metadata_females[relevant_samples,]
+counts_subset <- counts_females[,relevant_samples]
+
+# Verify cross-specific subsetting
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+
+# 3. Set up model matrix (note: Sex removed since all female)
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+mm <- model.matrix(~0 + Cross + Diet, data = metadata_subset)
+
+# 4. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n =8) 
+#keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+cat("\nNumber of genes retained:", sum(keep), "\n")
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC001xCC019 - CrossCC019xCC001, 
+                      levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 5. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,
+                       anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+#write.table(top.table, file = "Data/F_RIX1_DEGs.txt", 
+       #    row.names = F, sep = "\t", quote = F)
+
+# 6. Print summary of results
+cat("\nNumber of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+# min.count=60, min.total.count=100: 1 DEG 
+# 1 DEG -- Lactb gene
+```
+
+```{r}
+# RIX2 
+# CC019xCC040 RIX Analysis
+
+# 1. Subset to specific crosses and verify
+relevant_samples <- which(metadata_filtered$Cross %in% c("CC019xCC040", "CC040xCC019")) 
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify subsetting
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Total samples in analysis:", nrow(metadata_subset), "\n")
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+
+# 2. Set up model matrix
+Cross = metadata_subset$Cross 
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n =8) 
+#keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+cat("\nNumber of genes retained:", sum(keep), "\n")
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC019xCC040 - CrossCC040xCC019,
+                     levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 4. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,
+                      anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                      logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+#write.table(top.table, file = "Data/2_3_25/RIX2_DEGs.txt", 
+           #row.names = F, sep = "\t", quote = F)
+
+# 5. Print summary of results
+cat("\nNumber of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+# min.count=60, min.total.count=100: 93 DEGs 
+# 104 DEGs 
+```
+
+```{r}
+# RIX2 
+# CC019xCC040 RIX  (Males)
+
+# 1. Initial sex-specific subsetting and verification
+metadata_males <- metadata_filtered[metadata_filtered$Sex == "male", ]
+male_ids <- as.character(metadata_males$Animal.ID)
+counts_males <- counts_filtered[, male_ids]
+
+# Verify sex-specific subsetting
+stopifnot(all(colnames(counts_males) == metadata_males$Animal.ID))
+cat("Number of male samples in metadata:", nrow(metadata_males), "\n")
+cat("Number of male samples in counts:", ncol(counts_males), "\n")
+
+# 2. Further subset to specific crosses
+relevant_samples <- metadata_males$Cross %in% c("CC019xCC040", "CC040xCC019")
+metadata_subset <- metadata_males[relevant_samples,]
+counts_subset <- counts_males[,relevant_samples]
+
+# Verify cross-specific subsetting
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+
+# 3. Set up model matrix (note: Sex removed since all male)
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+mm <- model.matrix(~0 + Cross + Diet, data = metadata_subset)
+
+# 4. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n =8) 
+#keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+cat("\nNumber of genes retained:", sum(keep), "\n")
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC019xCC040 - CrossCC040xCC019, 
+                     levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 5. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,
+                      anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                      logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+#write.table(top.table, file = "Data/M_RIX2_DEGs.txt", 
+          # row.names = F, sep = "\t", quote = F)
+
+# 6. Print summary of results
+cat("\nNumber of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+# min.count=60, min.total.count=100: 0 DEGs 
+# 2 DEGs -- also had just 2 when I wasn't subsetting by samples prior to normalization/filtering 
+```
+
+```{r}
+# RIX2 
+# CC019xCC040 RIX  (females)
+
+# 1. Initial sex-specific subsetting and verification
+metadata_females <- metadata_filtered[metadata_filtered$Sex == "female", ]
+female_ids <- as.character(metadata_females$Animal.ID)
+counts_females <- counts_filtered[, female_ids]
+
+
+# Verify sex-specific subsetting
+stopifnot(all(colnames(counts_females) == metadata_females$Animal.ID))
+cat("Number of female samples in metadata:", nrow(metadata_females), "\n")
+cat("Number of female samples in counts:", ncol(counts_females), "\n")
+
+# 2. Further subset to specific crosses
+relevant_samples <- metadata_females$Cross %in% c("CC019xCC040", "CC040xCC019")
+metadata_subset <- metadata_females[relevant_samples,]
+counts_subset <- counts_females[,relevant_samples]
+
+# Verify cross-specific subsetting
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+
+# 3. Set up model matrix (note: Sex removed since all female)
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+mm <- model.matrix(~0 + Cross + Diet, data = metadata_subset)
+
+# 4. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n =8) 
+#keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+cat("\nNumber of genes retained:", sum(keep), "\n")
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC019xCC040 - CrossCC040xCC019, 
+                     levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 5. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,
+                      anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                      logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+#write.table(top.table, file = "Data/F_RIX2_DEGs.txt", 
+          # row.names = F, sep = "\t", quote = F)
+
+# 6. Print summary of results
+cat("\nNumber of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+# min.count=60, min.total.count=100: 674 DEGs!
+# 554 DEGs 
+```
+
+## B. Diet Effects
+
+```{r}
+# This analsis subsets samples counts/metadata before normalization, so should be accurate contrasts 
+# Diet Effect Analysis for Each RIX 
+
+analyze_diet_effect <- function(strain, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strain
+   relevant_samples <- metadata_filtered$Cross == strain
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for", strain, "Diet Effect ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per diet:\n")
+   print(table(metadata_subset$Diet))
+   
+   # 2. Set up model matrix
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Diet + Sex, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+  #keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+  keep <- filterByExpr(d0, mm, large.n =8) 
+  
+cat("\nNumber of genes retained:", sum(keep), "\n")
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(DietAIN - DietLP, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Define strains to analyze
+strains <- c("CC001xCC019", "CC019xCC001", "CC019xCC040", "CC040xCC019")
+
+# Run analysis for each strain
+all_results <- list()
+for(strain in strains) {
+   all_results[[strain]] <- analyze_diet_effect(strain, metadata_filtered, counts_filtered)
+}
+
+# Print summary of all results
+cat("\n=== Summary of Diet Effects by Strain ===\n")
+for(strain in strains) {
+   cat(sprintf("%s: %d DEGs\n", strain, all_results[[strain]]$DEGs))
+}
+
+# Optionally save detailed results for each strain
+#for(strain in strains) {
+#    write.table(all_results[[strain]]$results,
+#                file = paste0("Diet_effect_", strain, ".txt"),
+#                row.names = F, sep = "\t", quote = F)
+#}
+
+# min.count=60, min.total.count=100: 0 DEGs for all 4 (RIX1&2)
+# 0 DEGs for all 4 (RIX1&2)
+```
+
+## C. Sex Effects
+
+```{r}
+# Sex Effect Analysis for Each Strain
+
+analyze_sex_effect <- function(strain, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strain
+   relevant_samples <- metadata_filtered$Cross == strain
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for", strain, "Sex Effect ===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per sex:\n")
+   print(table(metadata_subset$Sex))
+   
+   # 2. Set up model matrix
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Sex + Diet, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, large.n =8) 
+   #keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+  logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(Sexmale - Sexfemale, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Define strains to analyze
+strains <- c("CC001xCC019", "CC019xCC001", "CC019xCC040", "CC040xCC019")
+
+# Run analysis for each strain
+all_results <- list()
+for(strain in strains) {
+   all_results[[strain]] <- analyze_sex_effect(strain, metadata_filtered, counts_filtered)
+}
+
+# Print summary of all results
+cat("\n=== Summary of Sex Effects by Strain ===\n")
+for(strain in strains) {
+   cat(sprintf("%s: %d DEGs\n", strain, all_results[[strain]]$DEGs))
+}
+
+# Optionally save detailed results for each strain
+#for(strain in strains) {
+#    write.table(all_results[[strain]]$results,
+#                file = paste0("Sex_effect_", strain, ".txt"),
+#                row.names = F, sep = "\t", quote = F)
+#}
+
+
+# min.count=60, min.total.count=100:
+#CC001xCC019: 0 DEGs
+#CC019xCC001: 0 DEGs
+#CC019xCC040: 88 DEGs !!
+#CC040xCC019: 0 DEGs
+
+#CC001xCC019: 0 DEGs
+#CC019xCC001: 0 DEGs
+#CC019xCC040: 63 DEGs
+#CC040xCC019: 0 DEGs
+```
+
+## D. Diet effect for each Strain/Sex combo
+
+```{r}
+# Diet Effect Analysis for Each Strain and Sex Combination
+
+analyze_diet_effect_by_sex <- function(strain, sex, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific strain and sex
+   relevant_samples <- metadata_filtered$Cross == strain & 
+                      metadata_filtered$Sex == sex
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat(sprintf("\n=== Analysis for %s, %s Only ===\n", strain, sex))
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per diet:\n")
+   print(table(metadata_subset$Diet))
+   
+   # 2. Set up model matrix (no Sex term needed since already stratified)
+   Diet = metadata_subset$Diet
+   mm <- model.matrix(~0 + Diet, data = metadata_subset)
+   
+   # Print model matrix structure
+   cat("\nModel matrix structure (first few rows):\n")
+   print(head(mm))
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm, large.n =8) 
+   #keep <- filterByExpr(d0, mm, min.count = 60, min.total.count = 100)
+   cat("\nNumber of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   logcpm <- cpm(d, prior.count=2, log=TRUE)
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   cat("\nCoefficient names:\n")
+   print(colnames(coef(fit)))
+   
+   contr <- makeContrasts(DietAIN - DietLP, 
+                         levels = colnames(coef(fit)))
+   
+   cat("\nContrast structure:\n")
+   print(contr)
+   
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("\nNumber of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   # 7. Add gene annotations
+   top.table$Gene <- rownames(top.table)
+   top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+   top.table <- data.frame(top.table,
+                          anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                          logcpm[match(top.table$Gene,rownames(logcpm)),])
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Define strains and sexes
+strains <- c("CC001xCC019", "CC019xCC001", "CC019xCC040", "CC040xCC019")
+sexes <- c("male", "female")
+
+# Run analysis for each strain-sex combination
+all_results <- list()
+for(strain in strains) {
+   all_results[[strain]] <- list()
+   for(sex in sexes) {
+       all_results[[strain]][[sex]] <- analyze_diet_effect_by_sex(strain, sex, 
+                                                                 metadata_filtered, 
+                                                                 counts_filtered)
+   }
+}
+
+# Print summary of all results
+cat("\n=== Summary of Diet Effects by Strain and Sex ===\n")
+for(strain in strains) {
+   cat(sprintf("\n%s:\n", strain))
+   for(sex in sexes) {
+       cat(sprintf("  %s: %d DEGs\n", sex, all_results[[strain]][[sex]]$DEGs))
+   }
+}
+
+# Optionally save detailed results for each strain-sex combination
+#for(strain in strains) {
+#    for(sex in sexes) {
+#        write.table(all_results[[strain]][[sex]]$results,
+#                    file = paste0("Diet_effect_", strain, "_", sex, ".txt"),
+#                    row.names = F, sep = "\t", quote = F)
+#    }
+#}
+
+
+# min.count=60, min.total.count=100: 0 DEGs for both M/F for both RIX1&2
+# 0 DEGs for both M/F for both RIX1&2
+```
+
+### 19x01 Outliers
+
+```{r}
+# CC019xCC001 Outlier Analysis
+
+# 1. Define and assign outlier status
+outlier_samples <- c("109", "113", "114", "116", "118", "124", "126", "127")
+metadata_filtered_no_outliers$Outlier <- ifelse(
+    metadata_filtered_no_outliers$Animal.ID %in% outlier_samples, 
+    "Yes", 
+    "No"
+)
+
+# 2. Subset to specific cross and verify
+relevant_samples <- metadata_filtered_no_outliers$Cross %in% c("CC019xCC001")
+metadata_subset <- metadata_filtered_no_outliers[relevant_samples,]
+counts_subset <- counts_filtered_no_outliers[,relevant_samples]
+
+# Verify subsetting
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Total samples in analysis:", nrow(metadata_subset), "\n")
+cat("\nSample counts by outlier status:\n")
+print(table(metadata_subset$Outlier))
+
+# 3. Set up model matrix
+Outlier = metadata_subset$Outlier
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Outlier + Diet + Sex, data = metadata_subset)
+
+# 4. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n=8)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(OutlierNo - OutlierYes, 
+                      levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 5. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+base_ids <- sub("_.*$", "", top.table$Gene)
+top.table <- data.frame(top.table,
+                       anno[match(base_ids,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+write.table(top.table, file = "Data/RIX1_19x01_outliers_DEGs.txt", 
+          row.names = F, sep = "\t", quote = F)
+
+# 6. Print summary of results
+cat("\nNumber of DEGs (FDR < 0.05):", length(which(top.table$adj.P.Val < 0.05)), "\n")
+
+## This is a very concerning result. Theres literally 3253 DEGs in these outliers vs the restof their group.. Something must be wrong, yet both counts/metadata dfs look right? 
+```
+
+# 6. Graphing
+
+## A. Volcano plots
+
+```{r}
+# RIX1 
+# CC001xCC019 RIX 
+
+# Note: were using p.value here not adj.P.val - Blithe used this approach here 
+
+# 1. Subset data and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC019", "CC019xCC001")
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify sample alignment and print summary
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Number of samples in analysis:", nrow(metadata_subset), "\n")
+print(table(metadata_subset$Cross)) # Check sample sizes per cross
+
+# 2. Proceed with analysis
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n=8)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC001xCC019 - CrossCC019xCC001, levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# Define color thresholds
+fc_threshold <- 1  # log2 fold change threshold
+p_threshold <- 0.05  # p-value threshold
+
+# Create a color vector
+logFC <- tmp$coefficients[,1]  # Assuming the first column contains log fold changes
+P.Value <- tmp$p.value[,1]  # Assuming the first column contains p-values
+
+colors <- rep("gray", length(logFC))
+colors[abs(logFC) > fc_threshold & P.Value < p_threshold] <- "red"
+colors[abs(logFC) > fc_threshold & P.Value >= p_threshold] <- "blue"
+colors[abs(logFC) <= fc_threshold & P.Value < p_threshold] <- "green"
+
+# Create the volcano plot
+png("Plots/RIX1/2_3_25/RIX1_volcano_50_DEGs.png", width = 800, height = 600)
+volcanoplot(tmp, coef = 1, highlight = 25, 
+            names = anno[match(rownames(tmp), anno$Gene.stable.ID.version), "Gene.name"],
+            main = "CC001xCC019 vs CC019xCC001",
+            cex.main = 0.8,
+            col = colors,
+            pch = 20)
+
+# Add a legend
+legend("topright", 
+       legend = c("Not significant", 
+                  "FC > 1 & p < 0.05", 
+                  "FC > 1 & p >= 0.05", 
+                  "FC <= 1 & p < 0.05"),
+       col = c("gray", "red", "blue", "green"), 
+       pch = 20, 
+       cex = 0.8, 
+       bg = "white")
+
+dev.off()
+
+# Print summary statistics
+print(summary(logFC))
+print(summary(-log10(P.Value)))
+print(table(colors))
+
+# Check if gene names match
+head(anno[match(rownames(tmp), anno$Gene.stable.ID.version),
+     c("Gene.stable.ID.version", "Gene.name") ])
+print(identical(anno[match(rownames(tmp), anno$Gene.stable.ID.version),
+     c("Gene.stable.ID.version")], rownames(tmp)))
+```
+
+```{r}
+# RIX2 
+# CC019xCC040 RIX  
+
+# Note: were using p.value here not adj.P.val - Blithe used this approach here 
+
+# 1. Subset to specific crosses and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC019xCC040", "CC040xCC019") 
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify subsetting
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Total samples in analysis:", nrow(metadata_subset), "\n")
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+
+# 2. Set up model matrix
+Cross = metadata_subset$Cross 
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n=8)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC019xCC040 - CrossCC040xCC019,
+                     levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# Define color thresholds
+fc_threshold <- 1  # log2 fold change threshold
+p_threshold <- 0.05  # p-value threshold
+
+# Create a color vector
+logFC <- tmp$coefficients[,1]  # Assuming the first column contains log fold changes
+P.Value <- tmp$p.value[,1]  # Assuming the first column contains p-values
+
+colors <- rep("gray", length(logFC))
+colors[abs(logFC) > fc_threshold & P.Value < p_threshold] <- "red"
+colors[abs(logFC) > fc_threshold & P.Value >= p_threshold] <- "blue"
+colors[abs(logFC) <= fc_threshold & P.Value < p_threshold] <- "green"
+
+# Create the volcano plot
+png("Plots/RIX2/2_3_25/RIX2_volcano_50_DEGs.png", width = 800, height = 600)
+volcanoplot(tmp, coef = 1, highlight = 25, 
+            names = anno[match(rownames(tmp), anno$Gene.stable.ID.version), "Gene.name"],
+            main = "CC019xCC040 vs CC040xCC019",
+            cex.main = 0.8,
+            col = colors,
+            pch = 20)
+
+# Add a legend
+legend("topright", 
+       legend = c("Not significant", 
+                  "FC > 1 & p < 0.05", 
+                  "FC > 1 & p >= 0.05", 
+                  "FC <= 1 & p < 0.05"),
+       col = c("gray", "red", "blue", "green"), 
+       pch = 20, 
+       cex = 0.8, 
+       bg = "white")
+
+dev.off()
+
+# Print summary statistics
+print(summary(logFC))
+print(summary(-log10(P.Value)))
+print(table(colors))
+
+# Check if gene names match
+head(anno[match(rownames(tmp), anno$Gene.stable.ID.version),
+     c("Gene.stable.ID.version", "Gene.name") ])
+print(identical(anno[match(rownames(tmp), anno$Gene.stable.ID.version),
+     c("Gene.stable.ID.version")], rownames(tmp)))
+```
+
+## B. Heatmap
+
+```{r fig.height=8}
+# RIX1 
+# CC001xCC019 RIX
+
+# Samples NOT hierarchically clustered 
+
+# 1. Subset data and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC019", "CC019xCC001")
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify sample alignment and print summary
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Number of samples in analysis:", nrow(metadata_subset), "\n")
+print(table(metadata_subset$Cross)) # Check sample sizes per cross
+
+# 2. Proceed with analysis
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n=8)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC001xCC019 - CrossCC019xCC001, levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 4. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = 25)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+
+# Order the samples in the metadata based on the Cross variable
+ordered_samples <- metadata_subset[order(metadata_subset$Cross), ]
+
+# Convert Animal.ID to character to match the column names
+ordered_samples$Animal.ID <- as.character(ordered_samples$Animal.ID)
+
+# Reorder the columns of counts_subset based on ordered_samples
+counts_subset_ordered <- counts_subset[, ordered_samples$Animal.ID]
+
+# If it's a data frame, convert it to a matrix
+counts_matrix <- as.matrix(counts_subset_ordered)
+
+# Prepare annotation for rows
+row_annotation <- anno[match(rownames(top.table), anno$Gene.stable.ID.version), "Gene.name"]
+
+# Ensure matching row names
+identical(anno[match(rownames(top.table), anno$Gene.stable.ID.version), "Gene.stable.ID.version"], rownames(top.table))
+
+# Create and save the heatmap
+png(filename = "Plots/RIX1/2_3_25/RIX1_heatmap.png", width = 2000, height = 800)
+
+# Generate the heatmap with the reordered data
+heatmap.2(
+  counts_matrix[rownames(top.table), ],
+  col = brewer.pal(11, "RdBu"),
+  scale = "row",
+  trace = "none",
+  labRow = row_annotation,
+  ColSideColors = as.character(factor(ordered_samples$Cross, labels = c("red", "blue"))),
+  Colv = FALSE,
+  main = "Top DEGs: CC001xCC019 vs CC019xCC001"
+)
+legend("topright", legend = levels(factor(ordered_samples$Cross)),
+       fill = c("red", "blue"), title = "Cross", cex = 0.8)
+
+# Save the plot to the PNG file and close the device
+dev.off()
+
+#Note: this worked to put 01x19 samples on the left and 19x01 samples on the right -- Interesting block of samples on right w many downregulated (- Zscore) genes includes 109, 113, 114, 116, 118, 120, 124, 126, and 127, which covers both males/females and both AIN/LP, so I'm unclear why those samples are behaving so much differently tham the other 19x01 samples 
+```
+
+```{r fig.height=8}
+# RIX1 
+# CC001xCC019 RIX
+
+# Samples hierarchically clustered 
+
+# 1. Subset data and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC001xCC019", "CC019xCC001")
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify sample alignment and print summary
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Number of samples in analysis:", nrow(metadata_subset), "\n")
+print(table(metadata_subset$Cross)) # Check sample sizes per cross
+
+# 2. Proceed with analysis
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n=8)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC001xCC019 - CrossCC019xCC001, levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 4. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = 25)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+
+
+# Create and save the heatmap
+png(filename = "Plots/RIX1/2_3_25/RIX1_heatmap_heirarchical.png", width = 2000, height = 800)
+
+# Generate the heatmap with hierarchical clustering
+heatmap.2(
+  counts_matrix[rownames(top.table), ],
+  col = brewer.pal(11, "RdBu"),
+  scale = "row",
+  trace = "none",
+  labRow = row_annotation,
+  ColSideColors = as.character(factor(ordered_samples$Cross, labels = c("red", "blue"))),
+  # Removed Colv = FALSE to allow hierarchical clustering
+  main = "Top DEGs: CC001xCC019 vs CC019xCC001"
+)
+
+# Save the plot to the PNG file and close the device
+dev.off()
+
+# Although the Z-Scores are smaller now, so the "outliers" seem less dramatic, they are still identifiable as an odd block not aligning with the rest of the 19x01 samples. However, when I do the hierarchical clustering, the outliers don't all cluster together, so unsure if I'm observing biologically meaningful results
+```
+
+```{r fig.height=8}
+# RIX2 
+# CC019xCC040 RIX 
+
+# Samples NOT hierarchically clustered 
+
+# 1. Subset to specific crosses and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC019xCC040", "CC040xCC019") 
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify subsetting
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Total samples in analysis:", nrow(metadata_subset), "\n")
+cat("\nSample sizes per cross:\n")
+print(table(metadata_subset$Cross))
+
+# 2. Set up model matrix
+Cross = metadata_subset$Cross 
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC019xCC040 - CrossCC040xCC019,
+                     levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 4. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = 25)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,
+                      anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                      logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+
+# Order the samples in the metadata based on the Cross variable
+ordered_samples <- metadata_subset[order(metadata_subset$Cross), ]
+
+# Convert Animal.ID to character to match the column names
+ordered_samples$Animal.ID <- as.character(ordered_samples$Animal.ID)
+
+# Reorder the columns of counts_subset based on ordered_samples
+counts_subset_ordered <- counts_subset[, ordered_samples$Animal.ID]
+
+# If it's a data frame, convert it to a matrix
+counts_matrix <- as.matrix(counts_subset_ordered)
+
+# Prepare annotation for rows
+row_annotation <- anno[match(rownames(top.table), anno$Gene.stable.ID.version), "Gene.name"]
+
+# Ensure matching row names
+identical(anno[match(rownames(top.table), anno$Gene.stable.ID.version), "Gene.stable.ID.version"], rownames(top.table))
+
+# Create and save the heatmap
+png(filename = "Plots/RIX2/2_3_25/RIX2_heatmap.png", width = 2000, height = 800)
+
+# Generate the heatmap with the reordered data
+heatmap.2(
+  counts_matrix[rownames(top.table), ],
+  col = brewer.pal(11, "RdBu"),
+  scale = "row",
+  trace = "none",
+  labRow = row_annotation,
+  ColSideColors = as.character(factor(ordered_samples$Cross, labels = c("red", "blue"))),
+  Colv = FALSE,
+  main = "Top DEGs: CC019xCC040 vs CC040xCC019"
+)
+legend("topright", legend = levels(factor(ordered_samples$Cross)),
+       fill = c("red", "blue"), title = "Cross", cex = 0.8)
+
+# Save the plot to the PNG file and close the device
+dev.off()
+```
+
+```{r}
+# CC019xCC040 RIX 
+
+# Samples hierarchically clustered 
+
+# 1. Subset data and verify
+relevant_samples <- metadata_filtered$Cross %in% c("CC019xCC040", "CC040xCC019") 
+metadata_subset <- metadata_filtered[relevant_samples,]
+counts_subset <- counts_filtered[,relevant_samples]
+
+# Verify sample alignment and print summary
+stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+cat("Number of samples in analysis:", nrow(metadata_subset), "\n")
+print(table(metadata_subset$Cross)) # Check sample sizes per cross
+
+# 2. Proceed with analysis
+Cross = metadata_subset$Cross
+Diet = metadata_subset$Diet
+Sex = metadata_subset$Sex
+mm <- model.matrix(~0 + Cross + Diet + Sex, data = metadata_subset)
+
+# 3. DGE analysis pipeline
+d0 <- DGEList(counts_subset)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0, mm, large.n=8)
+d <- d0[keep,]
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+contr <- makeContrasts(CrossCC019xCC040 - CrossCC040xCC019,
+                     levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+
+# 4. Results processing
+top.table <- topTable(tmp, coef = 1, sort.by = "P", n = 25)
+top.table$Gene <- rownames(top.table)
+top.table <- top.table[,c("Gene", names(top.table)[1:6])]
+top.table <- data.frame(top.table,anno[match(top.table$Gene,anno$Gene.stable.ID.version),],
+                       logcpm[match(top.table$Gene,rownames(logcpm)),])
+colnames(top.table) <- sub("^X", "", colnames(top.table))
+
+
+# Create and save the heatmap
+png(filename = "Plots/RIX2/2_3_25/RIX2_heatmap_heirarchical.png", width = 2000, height = 800)
+
+# Generate the heatmap with hierarchical clustering
+heatmap.2(
+  counts_matrix[rownames(top.table), ],
+  col = brewer.pal(11, "RdBu"),
+  scale = "row",
+  trace = "none",
+  labRow = row_annotation,
+  ColSideColors = as.character(factor(ordered_samples$Cross, labels = c("red", "blue"))),
+  # Removed Colv = FALSE to allow hierarchical clustering
+  main = "Top DEGs: CC019xCC040 vs CC040xCC019"
+)
+
+# Save the plot to the PNG file and close the device
+dev.off()
+```
+
+## C. 2 factor venn diagram
+
+```{r fig.width=6, fig.height=6}
+
+# Since RIX1 didn't have many POE (zero diet) DEGs, this isn't infomrative 
+
+# Run decideTests for each contrast (RIX1 and RIX2)
+results1 <- decideTests(tmp1)  # Results for RIX1
+results2 <- decideTests(tmp2)  # Results for RIX2
+
+# Combine the results into a matrix for the Venn diagram
+combined_results <- cbind(RIX1 = results1, RIX2 = results2)
+
+# Create the Venn diagram
+vennDiagram(
+  combined_results,
+  names = c("RIX1", "RIX2"),
+  main = "DE Genes Between CC-RIXs",
+  cex.main = 0.8
+)
+
+#The two (01x19 and 19x40) CCRIXs have zero overlapping DEGs 
+#Note: change the "simple PLotting" blocks above to include tmp1/tmp2 for this analysis -- had to change back for figures
+```
+
+# 7. Enrichment (RIX)
+
+Note: using Raw.P.values instead of adjusted
+
+## **A. GO: Gene Ontology**
+
+```{r}
+# RIX1 
+# CC001xCC019 RIX 
+
+infile <- "Data/2_3_25/RIX1_DEGs.txt"
+DE <- read.delim(infile)
+
+colnames(DE) <- sub("^X", "", colnames(DE))
+#head(DE)
+
+# Add entrezgene IDs to top table
+tmp <- bitr(DE$Gene.stable.ID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+id.conv <- subset(tmp, !duplicated(tmp$ENSEMBL))
+DE <- left_join(DE, id.conv, by = c("Gene.stable.ID" = "ENSEMBL"))
+
+# Make gene list (Raw.P.value) 
+DE.nodupENTREZ <- subset(DE, !is.na(ENTREZID) & !duplicated(ENTREZID))
+geneList <- DE.nodupENTREZ$P.Value
+names(geneList) <- DE.nodupENTREZ$ENTREZID
+head(geneList)
+
+# Create topGOData object
+GOdata <- new("topGOdata",
+	ontology = "BP",
+	allGenes = geneList,
+	geneSelectionFun = function(x)x,
+	annot = annFUN.org , mapping = "org.Mm.eg.db")
+
+
+#The topGOdata object is then used as input for enrichment testing
+
+# Kolmogorov-Smirnov testing
+resultKS <- runTest(GOdata, algorithm = "weight01", statistic = "ks")
+tab <- GenTable(GOdata, P.Value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+head(tab, 15)
+
+
+# Bubble Plot visualization
+
+png(filename = "Plots/RIX1/2_3_25/RIX1_P.value_GO_enrichment_BubblePlot.png", width = 700, height = 600)
+
+#Correct GeneRatio calculation
+tab$GeneCount <- as.numeric(tab$Significant)
+tab$TotalGenes <- max(tab$GeneCount)  # Assuming the largest number is the total gene count
+tab$GeneRatio <- tab$GeneCount / tab$TotalGenes
+
+# Calculate -log10(P.Value)
+tab$log10pvalue <- -log10(as.numeric(tab$P.Value))
+
+# Select top 10 terms
+top_10 <- head(tab, 10)
+
+# Create the bubble plot
+ggplot(top_10, aes(x = GeneRatio, y = reorder(Term, GeneRatio))) +
+  geom_point(aes(size = GeneCount, color = log10pvalue)) +
+  scale_color_gradient(low = "blue", high = "red") +
+  scale_size_continuous(range = c(3, 10)) +
+  scale_x_continuous(labels = scales::percent_format(scale = 100),
+                     breaks = scales::pretty_breaks(n = 5)) +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 8),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Gene Ratio", 
+       y = "GO Term", 
+       title = "CC001xCC019 vs CC019xCC001: Top 10 Enriched GO Terms",
+       size = "Gene Count",
+       color = "-log10(P.Value)")
+
+# Save the plot to the PNG file and close the device
+dev.off()
+```
+
+```{r}
+# RIX2 
+# CC019xCC040 RIX 
+
+infile <- "Data/2_3_25/RIX2_DEGs.txt"
+DE <- read.delim(infile)
+
+colnames(DE) <- sub("^X", "", colnames(DE))
+#head(DE)
+
+# Add entrezgene IDs to top table
+tmp <- bitr(DE$Gene.stable.ID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+id.conv <- subset(tmp, !duplicated(tmp$ENSEMBL))
+DE <- left_join(DE, id.conv, by = c("Gene.stable.ID" = "ENSEMBL"))
+
+# Make gene list (P.Value) 
+DE.nodupENTREZ <- subset(DE, !is.na(ENTREZID) & !duplicated(ENTREZID))
+geneList <- DE.nodupENTREZ$P.Value
+names(geneList) <- DE.nodupENTREZ$ENTREZID
+head(geneList)
+
+# Create topGOData object
+GOdata <- new("topGOdata",
+	ontology = "BP",
+	allGenes = geneList,
+	geneSelectionFun = function(x)x,
+	annot = annFUN.org , mapping = "org.Mm.eg.db")
+
+#The topGOdata object is then used as input for enrichment testing
+
+# Kolmogorov-Smirnov testing
+resultKS <- runTest(GOdata, algorithm = "weight01", statistic = "ks")
+tab <- GenTable(GOdata, P.Value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+head(tab, 15)
+
+# Bubble Plot visualization
+
+png(filename = "Plots/RIX2/2_3_25/RIX2_P.Value_GO_enrichment_BubblePlot.png", width = 700, height = 600)
+
+#Correct GeneRatio calculation
+tab$GeneCount <- as.numeric(tab$Significant)
+tab$TotalGenes <- max(tab$GeneCount)  # Assuming the largest number is the total gene count
+tab$GeneRatio <- tab$GeneCount / tab$TotalGenes
+
+# Calculate -log10(P.Value)
+tab$log10pvalue <- -log10(as.numeric(tab$P.Value))
+
+# Select top 10 terms
+top_10 <- head(tab, 10)
+
+# Create the bubble plot
+ggplot(top_10, aes(x = GeneRatio, y = reorder(Term, GeneRatio))) +
+  geom_point(aes(size = GeneCount, color = log10pvalue)) +
+  scale_color_gradient(low = "blue", high = "red") +
+  scale_size_continuous(range = c(3, 10)) +
+  scale_x_continuous(labels = scales::percent_format(scale = 100),
+                     breaks = scales::pretty_breaks(n = 5)) +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 8),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Gene Ratio", 
+       y = "GO Term", 
+       title = "CC019xCC040 vs CC040xCC019: Top 10 Enriched GO Terms",
+       size = "Gene Count",
+       color = "-log10(P.Value)")
+
+# Save the plot to the PNG file and close the device
+dev.off()
+```
+
+## **B. KEGG: Kyoto Encyclopedia of Genes and Genomes**
+
+```{r}
+# RIX1 
+# CC001xCC019 RIX 
+
+infile <- "Data/2_3_25/RIX1_DEGs.txt"
+DE <- read.delim(infile)
+
+colnames(DE) <- sub("^X", "", colnames(DE))
+#head(DE)
+
+# Add entrezgene IDs to top table
+tmp <- bitr(DE$Gene.stable.ID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+id.conv <- subset(tmp, !duplicated(tmp$ENSEMBL))
+DE <- left_join(DE, id.conv, by = c("Gene.stable.ID" = "ENSEMBL"))
+
+# Make gene list (Raw.P.value) 
+DE.nodupENTREZ <- subset(DE, !is.na(ENTREZID) & !duplicated(ENTREZID))
+
+geneList.KEGG <- DE.nodupENTREZ$t                   
+geneList.KEGG <- sort(geneList.KEGG, decreasing = TRUE)
+names(geneList.KEGG) <- DE.nodupENTREZ$ENTREZID
+head(geneList.KEGG)
+
+KEGG.results <- gseKEGG(gene = geneList.KEGG, organism = "mmu", pvalueCutoff = 1)
+KEGG.results <- setReadable(KEGG.results, OrgDb = "org.Mm.eg.db", keyType = "ENTREZID")
+outdat <- as.data.frame(KEGG.results)
+head(outdat)
+
+# Dotplot of KEGG enrichment results
+
+png(filename = "Plots/RIX1/2_3_25/RIX1_KEGG_BubblePlot.png", width = 700, height = 600)
+
+dotplot(KEGG.results)
+
+# Save the plot to the PNG file and close the device
+dev.off()
+
+# Barplot of p-values for top pathways
+
+png(filename = "Plots/RIX1/2_3_25/RIX1_KEGG_Barplot.png", width = 700, height = 600)
+
+plotdat <- outdat[1:10,]
+plotdat$nice.name <- gsub(" - Mus musculus (house mouse)", "", plotdat$Description, fixed = TRUE)
+
+ggplot(plotdat, aes(x = -log10(p.adjust), y = reorder(nice.name, -log10(p.adjust)), fill = setSize)) + geom_bar(stat = "identity") + labs(x = "-log10(P-Value)", y = NULL, fill = "# Genes") + scale_fill_gradient(low = "red", high = "blue")
+
+# Save the plot to the PNG file and close the device
+dev.off()
+```
+
+```{r}
+# RIX2 
+# CC019xCC040 RIX 
+
+infile <- "Data/2_3_25/RIX2_DEGs.txt"
+DE <- read.delim(infile)
+
+colnames(DE) <- sub("^X", "", colnames(DE))
+#head(DE)
+
+# Add entrezgene IDs to top table
+tmp <- bitr(DE$Gene.stable.ID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+id.conv <- subset(tmp, !duplicated(tmp$ENSEMBL))
+DE <- left_join(DE, id.conv, by = c("Gene.stable.ID" = "ENSEMBL"))
+
+# Make gene list (P.Value) 
+DE.nodupENTREZ <- subset(DE, !is.na(ENTREZID) & !duplicated(ENTREZID))
+
+geneList.KEGG <- DE.nodupENTREZ$t                   
+geneList.KEGG <- sort(geneList.KEGG, decreasing = TRUE)
+names(geneList.KEGG) <- DE.nodupENTREZ$ENTREZID
+head(geneList.KEGG)
+
+KEGG.results <- gseKEGG(gene = geneList.KEGG, organism = "mmu", pvalueCutoff = 1)
+KEGG.results <- setReadable(KEGG.results, OrgDb = "org.Mm.eg.db", keyType = "ENTREZID")
+outdat <- as.data.frame(KEGG.results)
+head(outdat)
+
+# Dotplot of KEGG enrichment results
+
+png(filename = "Plots/RIX2/2_3_25/RIX2_KEGG_BubblePlot.png", width = 700, height = 600)
+
+dotplot(KEGG.results)
+
+# Save the plot to the PNG file and close the device
+dev.off()
+
+# Barplot of p-values for top pathways
+
+png(filename = "Plots/RIX2/2_3_25/RIX2_KEGG_Barplot.png", width = 700, height = 600)
+
+plotdat <- outdat[1:10,]
+plotdat$nice.name <- gsub(" - Mus musculus (house mouse)", "", plotdat$Description, fixed = TRUE)
+
+ggplot(plotdat, aes(x = -log10(p.adjust), y = reorder(nice.name, -log10(p.adjust)), fill = setSize)) + geom_bar(stat = "identity") + labs(x = "-log10(P-Value)", y = NULL, fill = "# Genes") + scale_fill_gradient(low = "red", high = "blue")
+
+# Save the plot to the PNG file and close the device
+dev.off()
+```
+
+# END
+
+### Pathview plot of log fold changes on KEGG diagram
+
+```{r}
+# Note: 
+
+#19x40 KEGG visualization for Ribosome pathway  
+#Note: very underwhelming figure with only 2 downregulated ribo subunits from 19x40 vs 40x19 
+
+foldChangeList <- DE$logFC
+xx <- as.list(org.Mm.egENSEMBL2EG)
+names(foldChangeList) <- xx[sapply(strsplit(DE$Gene,split="\\."),"[[", 1L)]
+head(foldChangeList)
+
+mmu03010 <- pathview(gene.data  = foldChangeList,
+                     pathway.id = "mmu03010",
+                     species    = "mmu",
+                     limit      = list(gene=max(abs(foldChangeList)), cpd=1))
+```
+
+**showSigOfNodes plot the GO graph for the 2 most significant terms and their parents**
+
+```{r, fig.width = 20, fig.height = 20}
+#Note: this is from the Reference DE_analysis workbook - don't like visualization 
+
+par(cex = 0.3)
+showSigOfNodes(GOdata, score(resultKS), firstSigNodes = 2, useInfo = "def", .NO.CHAR = 40)
+par(cex = 1)
+```

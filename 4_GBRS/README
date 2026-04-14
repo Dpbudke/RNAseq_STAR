@@ -1,4 +1,0 @@
-This is now the complete compilation of necessary scripts to do GBRS allele-specific-expression in CC mice. Look at Rstudio/GBRS for documentation of how I generated the necessary transition probabaility files for CC mice. I intend to extend GBRS to assess ASE in CCRIX mice, but need to work through generating CCRIX transprob files first. 
-
-Dawson Budke
-3/11/25

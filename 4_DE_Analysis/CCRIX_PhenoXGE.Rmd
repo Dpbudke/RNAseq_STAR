@@ -1,0 +1,1738 @@
+---
+title: "CCRIX_PhenoXGE"
+date: 11/12/24
+output: html_notebook
+---
+
+Adapting all code from Phoebe's "CCDiet_PhenoXGEcorr2020_clean.Rmd"
+
+# **1. Load Packages**
+
+```{r}
+# Clear environment to start fresh (if necessary)
+rm(list = ls())
+
+# Load libraries; removed lubridate because I need to use the intersect function from plyr and not lubridate
+library(reshape2)
+library(reshape)
+library(plyr)
+library(dplyr)
+library(magrittr)
+library(purrr)
+library(ggpubr)
+library(WGCNA)
+library(data.table)
+library(corrplot)
+```
+
+# **2. Load in annotation**
+
+```{r}
+# DEGs
+anno <- read.delim("ensembl_mm_112.txt",as.is=T)
+```
+
+# 3. Load normalized counts, haplotype, and metadata/Phenotype Files
+
+```{r}
+# RIX2 DEG 
+infile1 <- "/90daydata/do2_projects/Data4R/CCRIX/Data/2_3_25/RIX2_DEGs.txt"
+RIX2_DEG <- read.delim(infile1)
+colnames(RIX2_DEG) <- sub("^X", "", colnames(RIX2_DEG))
+
+#Remove anno info from DEGs, just includes gene name and samples
+RIX2_DEG <- RIX2_DEG[, -(2:20)]
+
+```
+
+```{r}
+# RIX2 DEG 
+# Note: RIX1 doesn't have DEGs, so I can assess their non-FDR adj DEGs correlations, but for now I'm just assessing RIX2  
+
+# Load in Excel file and read the "pups" sheet
+Pheno <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", sheet = "Pups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Add Cross column 
+Pheno$Cross <- paste0(Pheno$CC.Mom.Strain, "x", Pheno$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+Pheno$Diet <- gsub("Low Protein", "LP", Pheno$Diet)
+Pheno$Diet <- gsub("AIN-93G", "AIN", Pheno$Diet)
+
+#Filter Pheno to only include 64 RIX2 samples 
+# Get the sample names from the counts data
+sample_names <- colnames(RIX2_DEG)
+
+# Filter the metadata to include only the samples present in the counts data
+Pheno_filtered <- Pheno %>%  filter(`Animal.ID` %in% sample_names)
+
+# Check if sample columns (excluding the gene column) match Animal IDs
+all_samples_present <- all(colnames(RIX2_DEG)[-1] %in% Pheno_filtered$`Animal.ID`)
+
+# Verify that the order matches
+all(colnames(RIX2_DEG)[-1] == Pheno_filtered$`Animal.ID`)
+
+# If the above returns TRUE, your metadata and counts are now correctly ordered and matched
+
+#Final files = RIX2_DEG and Pheno_filtered 
+```
+
+```{r}
+# RIX2 DEI 
+
+infile1 <- "/90daydata/do2_projects/Data4R/ASE/Results/DEIs/ASE_RIX2_DEGs.txt"
+RIX2_DEI <- read.delim(infile1)
+colnames(RIX2_DEI) <- sub("^X", "", colnames(RIX2_DEI))
+
+#Remove anno info from DEGs, just includes gene name and samples
+RIX2_DEI <- RIX2_DEI[, -(2:14)]
+
+Master_haplo <- read.csv("/90daydata/do2_projects/Data4R/ASE/Data/Final_counts/combined_haplotypes.csv", row.names = 1)
+colnames(Master_haplo) <- sub("^X", "", colnames(Master_haplo))
+```
+
+```{r}
+# RIX2 DEI 
+
+# Load in Excel file and read the "pups" sheet
+Pheno <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", sheet = "Pups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Add Cross column 
+Pheno$Cross <- paste0(Pheno$CC.Mom.Strain, "x", Pheno$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+Pheno$Diet <- gsub("Low Protein", "LP", Pheno$Diet)
+Pheno$Diet <- gsub("AIN-93G", "AIN", Pheno$Diet)
+
+#Filter Pheno to only include 64 RIX2 samples 
+# Get the sample names from the counts data
+sample_names <- colnames(RIX2_DEI)
+
+# Filter the metadata to include only the samples present in the counts data
+Pheno_filtered <- Pheno %>%  filter(`Animal.ID` %in% sample_names)
+
+Master_haplo_1 <- Master_haplo[, colnames(Master_haplo) %in% sample_names]
+
+# Check if sample columns (excluding the gene column) match Animal IDs
+all_samples_present <- all(colnames(RIX2_DEI)[-1] %in% Pheno_filtered$`Animal.ID`)
+
+# Verify that the order matches
+all(colnames(RIX2_DEI)[-1] == Pheno_filtered$`Animal.ID`)
+
+# If the above returns TRUE, your metadata and counts are now correctly ordered and matched
+
+#Final files = RIX2_DEI and Pheno_filtered 
+```
+
+```{r}
+#RIX2 DEIs (83 diff haplo DEIs only) - filtering RIX2 DEIs dfs
+
+# First read the genes with different haplotypes
+diff_haplo_genes <- read.delim("/90daydata/do2_projects/Data4R/ASE/Results/DEIs/RIX2_DEI_diff_haplo_genes.txt")
+# Assuming the gene names are in the first column
+genes_of_interest <- diff_haplo_genes[,1]
+
+# Filter RIX2_DEI to keep only the genes with different haplotypes
+RIX2_DEI_filtered <- RIX2_DEI[RIX2_DEI$Gene %in% genes_of_interest, ]
+
+
+
+# Filter Master_haplo to keep only the genes with different haplotypes
+Master_haplo_filtered <- Master_haplo_1[rownames(Master_haplo_1) %in% genes_of_interest, ]
+
+#Final files = RIX2_DEI_filtered, Pheno_filtered, and  Master_haplo_filtered
+```
+
+# 4. Prepare normalized counts and phenotype matrices for correlation matrix
+
+```{r}
+# RIX2 DEG 
+#Note: need to transpose matrices for correlations (samples as rows, genes as columns)
+
+# Norm counts matrix
+# Set row names and transpose
+rownames(RIX2_DEG) <- RIX2_DEG[,1]
+DE_t <- t(as.matrix(RIX2_DEG))
+# Delete first row after transposition
+DE_t <- DE_t[-1,]
+
+# Save the row and column names
+sample_names <- rownames(DE_t)    # Save sample names (rows)
+gene_names <- colnames(DE_t)      # Save gene names (columns)
+# Convert to numeric while preserving structure
+DE_t <- matrix(as.numeric(unlist(DE_t)), 
+                           nrow=nrow(DE_t), 
+                           ncol=ncol(DE_t))
+# Reassign the names
+rownames(DE_t) <- sample_names    # Samples as rows
+colnames(DE_t) <- gene_names      # Genes as columns
+# Verify
+head(rownames(DE_t))  # Should show samples
+head(colnames(DE_t))  # Should show genes
+dim(DE_t)
+is.numeric(DE_t) #-- must be TRUE 
+
+
+# Pheno matrix
+#Remove extraneous columns (all but phenotypes)
+# Define columns to keep
+columns_to_keep <- c("Animal.ID", "Lean4w", "BodyWeight4w", "BodyFatPercent4w",  
+                    "BodyWeight8w", "BodyFatPercent8w", "Lean8w",
+                    "ALB2", "ALTPL", "UREL", "GLUC3", "HDLC4", "TRIGL", "CHOL2")
+
+# Filter DataFrame and set Animal.ID as row names
+Pheno_filtered <- Pheno_filtered[, columns_to_keep]  # Keep only specified columns
+rownames(Pheno_filtered) <- Pheno_filtered$Animal.ID  # Set Animal.ID as row names
+Pheno_filtered$Animal.ID <- NULL  # Remove Animal.ID column since it's now in row names
+
+# Check if columns are numeric
+table(apply(Pheno_filtered, 2, is.numeric)) # -- TRUE 
+
+Pheno_t = as.matrix(Pheno_filtered)
+is.numeric(Pheno_t) #-- must be TRUE
+
+#Final files = DE_t and Pheno_t
+
+
+#Save matrices for later
+#saveRDS(DE_t, file = "./PhenoXGE/CCRIX_DE_t_111224.rds")
+#saveRDS(Pheno_t, file = "./PhenoXGE/CCRIX_phenos_111224.rds")
+```
+
+```{r}
+# RIX2 DEI 
+
+# Norm counts matrix
+# Set row names and transpose
+rownames(RIX2_DEI) <- RIX2_DEI[,1]
+DE_t <- t(as.matrix(RIX2_DEI))
+# Delete first row after transposition
+DE_t <- DE_t[-1,]
+
+# Save the row and column names
+sample_names <- rownames(DE_t)    # Save sample names (rows)
+gene_names <- colnames(DE_t)      # Save gene names (columns)
+# Convert to numeric while preserving structure
+DE_t <- matrix(as.numeric(unlist(DE_t)), 
+                           nrow=nrow(DE_t), 
+                           ncol=ncol(DE_t))
+# Reassign the names
+rownames(DE_t) <- sample_names    # Samples as rows
+colnames(DE_t) <- gene_names      # Genes as columns
+# Verify
+head(rownames(DE_t))  # Should show samples
+head(colnames(DE_t))  # Should show genes
+dim(DE_t)
+is.numeric(DE_t) #-- must be TRUE 
+
+
+# Pheno matrix
+#Remove extraneous columns (all but phenotypes)
+# Define columns to keep
+columns_to_keep <- c("Animal.ID", "Lean4w", "BodyWeight4w", "BodyFatPercent4w",  
+                    "BodyWeight8w", "BodyFatPercent8w", "Lean8w",
+                    "ALB2", "ALTPL", "UREL", "GLUC3", "HDLC4", "TRIGL", "CHOL2")
+
+# Filter DataFrame and set Animal.ID as row names
+Pheno_filtered <- Pheno_filtered[, columns_to_keep]  # Keep only specified columns
+rownames(Pheno_filtered) <- Pheno_filtered$Animal.ID  # Set Animal.ID as row names
+Pheno_filtered$Animal.ID <- NULL  # Remove Animal.ID column since it's now in row names
+
+# Check if columns are numeric
+table(apply(Pheno_filtered, 2, is.numeric)) # -- TRUE 
+
+Pheno_t = as.matrix(Pheno_filtered)
+is.numeric(Pheno_t) #-- must be TRUE
+
+#Final files = DE_t and Pheno_t
+
+
+#Save matrices for later
+#saveRDS(DE_t, file = "./PhenoXGE/CCRIX_DE_t_111224.rds")
+#saveRDS(Pheno_t, file = "./PhenoXGE/CCRIX_phenos_111224.rds")
+```
+
+```{r}
+#RIX2 DEIs (83 diff haplo DEIs only)
+
+# Norm counts matrix
+# Set row names and transpose
+rownames(RIX2_DEI_filtered) <- RIX2_DEI_filtered[,1]
+DE_t <- t(as.matrix(RIX2_DEI_filtered))
+# Delete first row after transposition
+DE_t <- DE_t[-1,]
+
+# Save the row and column names
+sample_names <- rownames(DE_t)    # Save sample names (rows)
+gene_names <- colnames(DE_t)      # Save gene names (columns)
+# Convert to numeric while preserving structure
+DE_t <- matrix(as.numeric(unlist(DE_t)), 
+                           nrow=nrow(DE_t), 
+                           ncol=ncol(DE_t))
+# Reassign the names
+rownames(DE_t) <- sample_names    # Samples as rows
+colnames(DE_t) <- gene_names      # Genes as columns
+# Verify
+head(rownames(DE_t))  # Should show samples
+head(colnames(DE_t))  # Should show genes
+dim(DE_t)
+is.numeric(DE_t) #-- must be TRUE 
+
+
+# Pheno matrix
+#Remove extraneous columns (all but phenotypes)
+# Define columns to keep
+columns_to_keep <- c("Animal.ID", "Lean4w", "BodyWeight4w", "BodyFatPercent4w",  
+                    "BodyWeight8w", "BodyFatPercent8w", "Lean8w",
+                    "ALB2", "ALTPL", "UREL", "GLUC3", "HDLC4", "TRIGL", "CHOL2")
+
+# Filter DataFrame and set Animal.ID as row names
+Pheno_filtered <- Pheno_filtered[, columns_to_keep]  # Keep only specified columns
+rownames(Pheno_filtered) <- Pheno_filtered$Animal.ID  # Set Animal.ID as row names
+Pheno_filtered$Animal.ID <- NULL  # Remove Animal.ID column since it's now in row names
+
+# Check if columns are numeric
+table(apply(Pheno_filtered, 2, is.numeric)) # -- TRUE 
+
+Pheno_t = as.matrix(Pheno_filtered)
+is.numeric(Pheno_t) #-- must be TRUE
+```
+
+# 5. Run correlations (RIX2)
+
+```{r}
+# RIX2 DEG
+
+# Correlation just takes in the list of gene names, including both DEGs/non-DEGs, (not logFC, adj.P.val, etc), with each samples expression value, then also a Pheno df with each samples pheno values, then creates correlations for each gene x pheno 
+
+# Run correlation between DE_t and Pheno_t matrices
+GenePheno_cors <- bicorAndPvalue(as.matrix(DE_t), as.matrix(Pheno_t), 
+                                use = "pairwise.complete.obs", 
+                                alternative = "two.sided")
+# Get the pval table as a df
+GenePheno_cors_pval <- as.data.frame(GenePheno_cors$p)
+
+# Write a function that will check if there are values < 0.05
+SigFinder <- function(x){
+  sig <- any(x < 0.05)
+  return(sig)
+}
+
+# Run function on all rows, add results to df
+GenePheno_cors_pval$AnySig <- apply(GenePheno_cors_pval, 1, SigFinder)
+head(GenePheno_cors_pval)
+table(GenePheno_cors_pval$AnySig) # 7054 don't have significant correlations, 6546 do
+
+# Print number of significant p-values (p < 0.05) for each column
+significant_counts <- sapply(GenePheno_cors_pval, function(x) sum(x < 0.05, na.rm = TRUE))
+# Print results
+print(significant_counts)
+#Literally thousands of genes associated w each phenotype 
+```
+
+```{r}
+# RIX2 DEI 
+
+# Run correlation between DE_t and Pheno_t matrices
+GenePheno_cors <- bicorAndPvalue(as.matrix(DE_t), as.matrix(Pheno_t), 
+                                use = "pairwise.complete.obs", 
+                                alternative = "two.sided")
+# Get the pval table as a df
+GenePheno_cors_pval <- as.data.frame(GenePheno_cors$p)
+
+# Write a function that will check if there are values < 0.05
+SigFinder <- function(x){
+  sig <- any(x < 0.05)
+  return(sig)
+}
+
+# Run function on all rows, add results to df
+GenePheno_cors_pval$AnySig <- apply(GenePheno_cors_pval, 1, SigFinder)
+head(GenePheno_cors_pval)
+table(GenePheno_cors_pval$AnySig) # 3128 don't have significant correlations, 10045 do
+
+# Print number of significant p-values (p < 0.05) for each column
+significant_counts <- sapply(GenePheno_cors_pval, function(x) sum(x < 0.05, na.rm = TRUE))
+# Print results
+print(significant_counts)
+#Literally thousands of genes associated w each phenotype 
+```
+
+```{r}
+#RIX2 DEIs (83 diff haplo DEIs only)
+
+# Run correlation between DE_t and Pheno_t matrices
+GenePheno_cors <- bicorAndPvalue(as.matrix(DE_t), as.matrix(Pheno_t), 
+                                use = "pairwise.complete.obs", 
+                                alternative = "two.sided")
+# Get the pval table as a df
+GenePheno_cors_pval <- as.data.frame(GenePheno_cors$p)
+
+# Write a function that will check if there are values < 0.05
+SigFinder <- function(x){
+  sig <- any(x < 0.05)
+  return(sig)
+}
+
+# Run function on all rows, add results to df
+GenePheno_cors_pval$AnySig <- apply(GenePheno_cors_pval, 1, SigFinder)
+head(GenePheno_cors_pval)
+table(GenePheno_cors_pval$AnySig) # only 4 don't have significant correlations, 79 do
+
+# Print number of significant p-values (p < 0.05) for each column
+significant_counts <- sapply(GenePheno_cors_pval, function(x) sum(x < 0.05, na.rm = TRUE))
+# Print results
+print(significant_counts)
+```
+
+# 6. Subset genes, add anno info, save outputs
+
+```{r}
+# RIX2 DEG
+
+#Remove all duplicates from anno
+anno_duplicates <- anno %>% 
+  group_by(Gene.stable.ID.version) %>%
+  dplyr::summarise(count = n()) %>%
+  filter(count > 1)
+#print(nrow(anno_duplicates))
+anno_unique <- anno %>% distinct(Gene.stable.ID.version, .keep_all = TRUE)
+
+
+# 1. Genes significantly correlated with ANY phenotype 
+AllSigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$AnySig == T),]
+AllSigCorrs_pval$Gene <- rownames(AllSigCorrs_pval) 
+AllSigCorrs_pval_annotated <- left_join(AllSigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(AllSigCorrs_pval_annotated, file = "./Results/DEG/RIX2_AllSigCorrs_bicorOutput.rds")
+
+# 2. Genes significantly correlated with wk8BF% 
+BF_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$BodyFatPercent8w < 0.05),]
+BF_SigCorrs_pval$Gene <- rownames(BF_SigCorrs_pval) 
+BF_SigCorrs_pval_annotated <- left_join(BF_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(BF_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_BF_SigCorrs_bicorOutput.rds")
+
+# 3. Genes significantly correlated with CHOL2 
+CHOL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$CHOL2 < 0.05),]
+CHOL_SigCorrs_pval$Gene <- rownames(CHOL_SigCorrs_pval) 
+CHOL_SigCorrs_pval_annotated <- left_join(CHOL_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(CHOL_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_CHOL_SigCorrs_bicorOutput.rds")
+
+# 4. Genes significantly correlated with HDL
+HDL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$HDLC4 < 0.05),]
+HDL_SigCorrs_pval$Gene <- rownames(HDL_SigCorrs_pval) 
+HDL_SigCorrs_pval_annotated <- left_join(HDL_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(HDL_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_HDL_SigCorrs_bicorOutput.rds")
+
+# 5. For Triglycerides (TRIGL)
+TRIGL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$TRIGL < 0.05),]
+TRIGL_SigCorrs_pval$Gene <- rownames(TRIGL_SigCorrs_pval) 
+TRIGL_SigCorrs_pval_annotated <- left_join(TRIGL_SigCorrs_pval, 
+                                          anno_unique, 
+                                          by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(TRIGL_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_TRIGL_SigCorrs_bicorOutput.rds")
+
+# 6. For Glucose (GLUC3)
+GLUC3_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$GLUC3 < 0.05),]
+GLUC3_SigCorrs_pval$Gene <- rownames(GLUC3_SigCorrs_pval) 
+GLUC3_SigCorrs_pval_annotated <- left_join(GLUC3_SigCorrs_pval, 
+                                          anno_unique, 
+                                          by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(GLUC3_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_GLUC3_SigCorrs_bicorOutput.rds")
+
+# 7. For Body Weight at 8 weeks (BodyWeight8w)
+BodyWeight8w_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$BodyWeight8w < 0.05),]
+BodyWeight8w_SigCorrs_pval$Gene <- rownames(BodyWeight8w_SigCorrs_pval) 
+BodyWeight8w_SigCorrs_pval_annotated <- left_join(BodyWeight8w_SigCorrs_pval, 
+                                                 anno_unique, 
+                                                 by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(BodyWeight8w_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_BodyWeight8w_SigCorrs_bicorOutput.rds")
+
+# 8. For Lean mass at 8 weeks (Lean8w)
+Lean8w_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$Lean8w < 0.05),]
+Lean8w_SigCorrs_pval$Gene <- rownames(Lean8w_SigCorrs_pval) 
+Lean8w_SigCorrs_pval_annotated <- left_join(Lean8w_SigCorrs_pval, 
+                                           anno_unique, 
+                                           by = c("Gene" = "Gene.stable.ID.version"))
+saveRDS(Lean8w_SigCorrs_pval_annotated, file = "./Results/DEG/RIX2_Lean8w_SigCorrs_bicorOutput.rds")
+```
+
+```{r}
+# RIX2 DEI 
+
+# Note: must use consistent anno throughout ASE pipeline-- version 105 
+
+ASE_anno <- readRDS("/90daydata/do2_projects/Data4R/ASE/Data/genes_with_id.rds") 
+# Create vector of chromosomes we want to keep
+keep_chr <- c(as.character(1:19), "X")
+# Filter the dataframe to keep only those chromosomes
+anno_filtered <- ASE_anno[ASE_anno$chromosome_name %in% keep_chr, ]
+# Get genes from Master_counts
+master_genes <- RIX2_DEI$Gene
+# Filter anno_filtered to keep only genes present in Master_counts
+anno_filtered <- anno_filtered[anno_filtered$ensembl_gene_id %in% master_genes, ]
+
+# Find duplicates in anno_filtered based on ensembl_gene_id
+anno_duplicates <- anno_filtered %>% 
+  group_by(ensembl_gene_id) %>%
+  dplyr::summarise(count = n()) %>%
+  filter(count > 1)
+# Remove duplicates keeping first occurrence
+anno_unique <- anno_filtered %>% 
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+
+
+# 1. Genes significantly correlated with ANY phenotype 
+AllSigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$AnySig == T),]
+AllSigCorrs_pval$Gene <- rownames(AllSigCorrs_pval) 
+AllSigCorrs_pval_annotated <- left_join(AllSigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(AllSigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_AllSigCorrs_bicorOutput.rds")
+
+# 2. Genes significantly correlated with wk8BF% 
+BF_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$BodyFatPercent8w < 0.05),]
+BF_SigCorrs_pval$Gene <- rownames(BF_SigCorrs_pval) 
+BF_SigCorrs_pval_annotated <- left_join(BF_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(BF_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_BF_SigCorrs_bicorOutput.rds")
+
+# 3. Genes significantly correlated with CHOL2 
+CHOL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$CHOL2 < 0.05),]
+CHOL_SigCorrs_pval$Gene <- rownames(CHOL_SigCorrs_pval) 
+CHOL_SigCorrs_pval_annotated <- left_join(CHOL_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(CHOL_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_CHOL_SigCorrs_bicorOutput.rds")
+
+# 4. Genes significantly correlated with HDL
+HDL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$HDLC4 < 0.05),]
+HDL_SigCorrs_pval$Gene <- rownames(HDL_SigCorrs_pval) 
+HDL_SigCorrs_pval_annotated <- left_join(HDL_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(HDL_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_HDL_SigCorrs_bicorOutput.rds")
+
+# 5. For Triglycerides (TRIGL)
+TRIGL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$TRIGL < 0.05),]
+TRIGL_SigCorrs_pval$Gene <- rownames(TRIGL_SigCorrs_pval) 
+TRIGL_SigCorrs_pval_annotated <- left_join(TRIGL_SigCorrs_pval, 
+                                          anno_unique, 
+                                          by = c("Gene" = "ensembl_gene_id"))
+saveRDS(TRIGL_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_TRIGL_SigCorrs_bicorOutput.rds")
+
+# 6. For Glucose (GLUC3)
+GLUC3_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$GLUC3 < 0.05),]
+GLUC3_SigCorrs_pval$Gene <- rownames(GLUC3_SigCorrs_pval) 
+GLUC3_SigCorrs_pval_annotated <- left_join(GLUC3_SigCorrs_pval, 
+                                          anno_unique, 
+                                          by = c("Gene" = "ensembl_gene_id"))
+saveRDS(GLUC3_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_GLUC3_SigCorrs_bicorOutput.rds")
+
+# 7. For Body Weight at 8 weeks (BodyWeight8w)
+BodyWeight8w_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$BodyWeight8w < 0.05),]
+BodyWeight8w_SigCorrs_pval$Gene <- rownames(BodyWeight8w_SigCorrs_pval) 
+BodyWeight8w_SigCorrs_pval_annotated <- left_join(BodyWeight8w_SigCorrs_pval, 
+                                                 anno_unique, 
+                                                 by = c("Gene" = "ensembl_gene_id"))
+saveRDS(BodyWeight8w_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_BodyWeight8w_SigCorrs_bicorOutput.rds")
+
+# 8. For Lean mass at 8 weeks (Lean8w)
+Lean8w_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$Lean8w < 0.05),]
+Lean8w_SigCorrs_pval$Gene <- rownames(Lean8w_SigCorrs_pval) 
+Lean8w_SigCorrs_pval_annotated <- left_join(Lean8w_SigCorrs_pval, 
+                                           anno_unique, 
+                                           by = c("Gene" = "ensembl_gene_id"))
+saveRDS(Lean8w_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/RIX2_Lean8w_SigCorrs_bicorOutput.rds")
+
+```
+
+```{r}
+# RIX2 DEIs (83 diff haplo DEIs only)
+
+# Note: must use consistent anno throughout ASE pipeline-- version 105 
+
+ASE_anno <- readRDS("/90daydata/do2_projects/Data4R/ASE/Data/genes_with_id.rds") 
+# Create vector of chromosomes we want to keep
+keep_chr <- c(as.character(1:19), "X")
+# Filter the dataframe to keep only those chromosomes
+anno_filtered <- ASE_anno[ASE_anno$chromosome_name %in% keep_chr, ]
+# Get genes from Master_counts
+master_genes <- RIX2_DEI_filtered$Gene
+# Filter anno_filtered to keep only genes present in Master_counts
+anno_filtered <- anno_filtered[anno_filtered$ensembl_gene_id %in% master_genes, ]
+
+# Find duplicates in anno_filtered based on ensembl_gene_id
+anno_duplicates <- anno_filtered %>% 
+  group_by(ensembl_gene_id) %>%
+  dplyr::summarise(count = n()) %>%
+  filter(count > 1)
+# Remove duplicates keeping first occurrence
+anno_unique <- anno_filtered %>% 
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+
+
+# 1. Genes significantly correlated with ANY phenotype 
+AllSigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$AnySig == T),]
+AllSigCorrs_pval$Gene <- rownames(AllSigCorrs_pval) 
+AllSigCorrs_pval_annotated <- left_join(AllSigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(AllSigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_AllSigCorrs_bicorOutput.rds")
+
+# 2. Genes significantly correlated with wk8BF% 
+BF_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$BodyFatPercent8w < 0.05),]
+BF_SigCorrs_pval$Gene <- rownames(BF_SigCorrs_pval) 
+BF_SigCorrs_pval_annotated <- left_join(BF_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(BF_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_BF_SigCorrs_bicorOutput.rds")
+
+# 3. Genes significantly correlated with CHOL2 
+CHOL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$CHOL2 < 0.05),]
+CHOL_SigCorrs_pval$Gene <- rownames(CHOL_SigCorrs_pval) 
+CHOL_SigCorrs_pval_annotated <- left_join(CHOL_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(CHOL_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_CHOL_SigCorrs_bicorOutput.rds")
+
+# 4. Genes significantly correlated with HDL
+HDL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$HDLC4 < 0.05),]
+HDL_SigCorrs_pval$Gene <- rownames(HDL_SigCorrs_pval) 
+HDL_SigCorrs_pval_annotated <- left_join(HDL_SigCorrs_pval, 
+                                       anno_unique, 
+                                       by = c("Gene" = "ensembl_gene_id"))
+saveRDS(HDL_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_HDL_SigCorrs_bicorOutput.rds")
+
+# 5. For Triglycerides (TRIGL)
+TRIGL_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$TRIGL < 0.05),]
+TRIGL_SigCorrs_pval$Gene <- rownames(TRIGL_SigCorrs_pval) 
+TRIGL_SigCorrs_pval_annotated <- left_join(TRIGL_SigCorrs_pval, 
+                                          anno_unique, 
+                                          by = c("Gene" = "ensembl_gene_id"))
+saveRDS(TRIGL_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_TRIGL_SigCorrs_bicorOutput.rds")
+
+# 6. For Glucose (GLUC3)
+GLUC3_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$GLUC3 < 0.05),]
+GLUC3_SigCorrs_pval$Gene <- rownames(GLUC3_SigCorrs_pval) 
+GLUC3_SigCorrs_pval_annotated <- left_join(GLUC3_SigCorrs_pval, 
+                                          anno_unique, 
+                                          by = c("Gene" = "ensembl_gene_id"))
+saveRDS(GLUC3_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_GLUC3_SigCorrs_bicorOutput.rds")
+
+# 7. For Body Weight at 8 weeks (BodyWeight8w)
+BodyWeight8w_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$BodyWeight8w < 0.05),]
+BodyWeight8w_SigCorrs_pval$Gene <- rownames(BodyWeight8w_SigCorrs_pval) 
+BodyWeight8w_SigCorrs_pval_annotated <- left_join(BodyWeight8w_SigCorrs_pval, 
+                                                 anno_unique, 
+                                                 by = c("Gene" = "ensembl_gene_id"))
+saveRDS(BodyWeight8w_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_BodyWeight8w_SigCorrs_bicorOutput.rds")
+
+# 8. For Lean mass at 8 weeks (Lean8w)
+Lean8w_SigCorrs_pval <- GenePheno_cors_pval[which(GenePheno_cors_pval$Lean8w < 0.05),]
+Lean8w_SigCorrs_pval$Gene <- rownames(Lean8w_SigCorrs_pval) 
+Lean8w_SigCorrs_pval_annotated <- left_join(Lean8w_SigCorrs_pval, 
+                                           anno_unique, 
+                                           by = c("Gene" = "ensembl_gene_id"))
+saveRDS(Lean8w_SigCorrs_pval_annotated, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Diff_haplo_DEIsXPheno/RIX2_Lean8w_SigCorrs_bicorOutput.rds")
+
+```
+
+# 7. Compare overlap of PhenoXGE genes with DEGs (RIX2)
+
+```{r}
+# RIX2 DEG
+
+# 7 Phenos for PhenoxGE: wk8 BF%, CHOL2, HDL, TRIGL, GLUC3, wk8 body weight, and wk8 lean mass
+
+# RIX2 
+infile1 <- "/90daydata/do2_projects/Data4R/CCRIX/Data/2_3_25/RIX2_DEGs.txt"
+RIX2_DEG <- read.delim(infile1)
+colnames(RIX2_DEG) <- sub("^X", "", colnames(RIX2_DEG))
+
+# Filter for significant results
+significant_de <- RIX2_DEG[RIX2_DEG$adj.P.Val < 0.05, ]
+
+#1 
+BF_overlapping_genes <- merge(significant_de, 
+                         BF_SigCorrs_pval_annotated, 
+                         by = "Gene")
+saveRDS(BF_overlapping_genes, file = "Results/DEG/Overlap/RIX2_BF_overlapping_genes.rds")
+
+
+#2 
+CHOL_overlapping_genes <- merge(significant_de, 
+                         CHOL_SigCorrs_pval_annotated, 
+                         by = "Gene")
+saveRDS(CHOL_overlapping_genes, file = "Results/DEG/Overlap/RIX2_CHOL_overlapping_genes.rds")
+
+
+#3 
+HDL_overlapping_genes <- merge(significant_de, 
+                         HDL_SigCorrs_pval_annotated, 
+                         by = "Gene")
+saveRDS(HDL_overlapping_genes, file = "Results/DEG/Overlap/RIX2_HDL_overlapping_genes.rds")
+ 
+
+
+#4
+TRIGL_overlapping_genes <- merge(significant_de, 
+                               TRIGL_SigCorrs_pval_annotated, 
+                               by = "Gene")
+saveRDS(TRIGL_overlapping_genes, file = "Results/DEG/Overlap/RIX2_TRIGL_overlapping_genes.rds")
+
+#5
+GLUC3_overlapping_genes <- merge(significant_de, 
+                               GLUC3_SigCorrs_pval_annotated, 
+                               by = "Gene")
+saveRDS(GLUC3_overlapping_genes, file = "Results/DEG/Overlap/RIX2_GLUC3_overlapping_genes.rds")
+
+#6
+BodyWeight8w_overlapping_genes <- merge(significant_de, 
+                                      BodyWeight8w_SigCorrs_pval_annotated, 
+                                      by = "Gene")
+saveRDS(BodyWeight8w_overlapping_genes, file = "Results/DEG/Overlap/RIX2_BodyWeight8w_overlapping_genes.rds")
+
+#7
+Lean8w_overlapping_genes <- merge(significant_de, 
+                                Lean8w_SigCorrs_pval_annotated, 
+                                by = "Gene")
+saveRDS(Lean8w_overlapping_genes, file = "Results/DEG/Overlap/RIX2_Lean8w_overlapping_genes.rds")
+
+```
+
+```{r}
+# RIX2 DEI 
+
+# 7 Phenos for PhenoxGE: wk8 BF%, CHOL2, HDL, TRIGL, GLUC3, wk8 body weight, and wk8 lean mass
+
+# RIX2 
+infile1 <- "/90daydata/do2_projects/Data4R/ASE/Results/DEIs/ASE_RIX2_DEGs.txt"
+RIX2_DEI <- read.delim(infile1)
+colnames(RIX2_DEI) <- sub("^X", "", colnames(RIX2_DEI))
+
+# Filter for significant results
+significant_de <- RIX2_DEI[RIX2_DEI$adj.P.Val < 0.05, ]
+
+#1 
+BF_overlapping_genes <- merge(significant_de, 
+                         BF_SigCorrs_pval_annotated, 
+                         by = "Gene")
+saveRDS(BF_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_BF_overlapping_genes.rds")
+
+
+#2 
+CHOL_overlapping_genes <- merge(significant_de, 
+                         CHOL_SigCorrs_pval_annotated, 
+                         by = "Gene")
+saveRDS(CHOL_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_CHOL_overlapping_genes.rds")
+
+
+#3 
+HDL_overlapping_genes <- merge(significant_de, 
+                         HDL_SigCorrs_pval_annotated, 
+                         by = "Gene")
+saveRDS(HDL_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_HDL_overlapping_genes.rds")
+
+
+#4
+TRIGL_overlapping_genes <- merge(significant_de, 
+                               TRIGL_SigCorrs_pval_annotated, 
+                               by = "Gene")
+saveRDS(TRIGL_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_TRIGL_overlapping_genes.rds")
+
+#5
+GLUC3_overlapping_genes <- merge(significant_de, 
+                               GLUC3_SigCorrs_pval_annotated, 
+                               by = "Gene")
+saveRDS(GLUC3_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_GLUC3_overlapping_genes.rds")
+
+#6
+BodyWeight8w_overlapping_genes <- merge(significant_de, 
+                                      BodyWeight8w_SigCorrs_pval_annotated, 
+                                      by = "Gene")
+saveRDS(BodyWeight8w_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_BodyWeight8w_overlapping_genes.rds")
+
+#7
+Lean8w_overlapping_genes <- merge(significant_de, 
+                                Lean8w_SigCorrs_pval_annotated, 
+                                by = "Gene")
+saveRDS(Lean8w_overlapping_genes, file = "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/RIX2_Lean8w_overlapping_genes.rds")
+
+```
+
+# 8. Process correlation coefficients (Bicor) - NA for now
+
+```{r}
+# Add R vals
+GenePheno_cors_bivcor <- as.data.frame(GenePheno_cors$bicor)
+GenePheno_cors_bivcor$Gene <- row.names(GenePheno_cors_bivcor)
+
+BF_SigCorrsBicor <- GenePheno_cors_bivcor[which(GenePheno_cors_bivcor$Gene %in% BF_SigCorrs_pval_annotated$Gene),]
+
+colnames(BF_SigCorrsBicor)[c(1:13)] <- paste0(names(BF_SigCorrsBicor[c(1:13)]), "_bicor")
+names(BF_SigCorrsBicor)
+
+BF_SigCorrsAnno_pvalBi <- left_join(BF_SigCorrs_pval_annotated, BF_SigCorrsBicor)
+names(BF_SigCorrsAnno_pvalBi)
+
+#write.csv(BF_SigCorrsAnno_pvalBi, file = "./PhenoXGE/BFgeCorr.csv", row.names = F)
+```
+
+# 9. Make correlation figure - NA for now
+
+```{r}
+# Get the row indices where Gene.name is blank
+blank_rows <- which(BF_SigCorrsAnno_pvalBi$Gene.name == "")
+
+# Replace blank Gene.name with the row number
+BF_SigCorrsAnno_pvalBi$Gene.name[blank_rows] <- paste0("Gene_", blank_rows)
+
+# Now try setting the row names again
+rownames(BF_SigCorrsAnno_pvalBi) <- BF_SigCorrsAnno_pvalBi$Gene.name
+
+# Get columns for p-values and correlations
+pvalCols <- names(BF_SigCorrsAnno_pvalBi[c(1:13)])
+rvalCols <- paste0(pvalCols, "_bicor")  # We still need this to get the correct correlation data
+
+# Define rows of interest
+pvalRows <- c("Hectd2os", "Gm36041", "Ces2e", "Pld5", "2210039B01Rik", "Wfdc2", "Nat8f7", 
+              "2410022M11Rik", "Gm44250", "Pde9a", "Lsm11" ,"Sugct", "Gga2", "Gm5817", "Itga6", 
+              "Gm6969", "Dnai1", "Cd300e", "Icam1", "Ywhaz", "Cpb2", "Gm57048", "Syngr1", 
+              "AI662270", "Casp8", "Wfdc21", "Gmds", "Snap47", "Gjc3", "H2-Q2")
+
+# Subset matrices
+cor_p <- BF_SigCorrsAnno_pvalBi[pvalCols]
+cor_p1 <- cor_p[which(row.names(cor_p) %in% pvalRows),]
+
+cor_r <- BF_SigCorrsAnno_pvalBi[rvalCols]
+cor_r1 <- cor_r[which(row.names(cor_r) %in% pvalRows),]
+
+# Order by BodyFatPercent8w correlation
+cor_r2 <- cor_r1[order(cor_r1$BodyFatPercent8w_bicor, decreasing = T),]
+cor_p2 <- cor_p1[row.names(cor_r2),]
+
+# Remove "_bicor" from column names before plotting
+colnames(cor_r2) <- gsub("_bicor$", "", colnames(cor_r2))
+
+# Create plot
+png(filename = "./PhenoXGE/Figs/BF_top30_PhenoGEcorr.png", 
+    width = 4000, height = 4000, units = "px", pointsize = 150)
+plot.new()
+corrplot(as.matrix(cor_r2), type = "full", order = "original",
+         p.mat = as.matrix(cor_p2), insig = "blank", tl.pos = "lt",
+         tl.cex = 0.55, sig.level = 0.05)
+dev.off()
+```
+
+# 10. Graph concordant DEGs/DEIs x DEIs correlated with Pheno
+
+```{r}
+# RIX2 
+
+# Create DEG/DEI Overlap by Pheno corr dfs - ie concordant genes differentially expressed by bth methods and corr w Pheno in both methods. Then, graph correlation with exp dots colored by haplotype 
+
+# Load required libraries
+library(dplyr)
+
+# Define directories
+deg_dir <- "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEG/Overlap/"
+dei_dir <- "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/DEI/Overlap/"
+output_dir <- "/90daydata/do2_projects/Data4R/CCRIX/PhenoXGE/Results/Overlap_Analysis/"
+
+# Create output directory if it doesn't exist
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Get list of RDS files in DEG directory
+deg_files <- list.files(deg_dir, pattern = "\\.rds$")
+
+# Process each file
+for (file in deg_files) {
+  tryCatch({
+    # Construct file paths
+    deg_path <- file.path(deg_dir, file)
+    dei_path <- file.path(dei_dir, file)
+    
+    # Check if corresponding DEI file exists
+    if (!file.exists(dei_path)) {
+      warning(sprintf("No matching DEI file found for %s", file))
+      next
+    }
+    
+    # Read the RDS files
+    deg_data <- readRDS(deg_path)
+    dei_data <- readRDS(dei_path)
+    
+    # Find overlapping genes
+    deg_genes <- unique(deg_data$Gene.stable.ID.x)
+    dei_genes <- unique(dei_data$Gene)
+    overlapping_genes <- intersect(deg_genes, dei_genes)
+    
+    # Filter DEI data for overlapping genes
+    overlap_data <- dei_data %>%
+      filter(Gene %in% overlapping_genes)
+    
+    # Create output filename
+    output_file <- file.path(output_dir, paste0("overlap_", file))
+    
+    # Save results as RDS
+    saveRDS(overlap_data, output_file)
+    
+    # Print summary
+    cat(sprintf("\nProcessed %s:\n", file))
+    cat(sprintf("  DEG genes: %d\n", length(deg_genes)))
+    cat(sprintf("  DEI genes: %d\n", length(dei_genes)))
+    cat(sprintf("  Overlapping genes: %d\n", length(overlapping_genes)))
+    cat(sprintf("  Output saved to: %s\n", output_file))
+    
+  }, error = function(e) {
+    warning(sprintf("Error processing %s: %s\n", file, e$message))
+  })
+}
+```
+
+```{r}
+# RIX2 
+
+# Load required libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(WGCNA)
+
+# Define founder strain mapping
+founder_strains <- c(
+    "AA" = "A/J",
+    "BB" = "C57BL/6J",
+    "CC" = "129S1/SvImJ",
+    "DD" = "NOD/ShiLtJ",
+    "EE" = "NZO/HlLtJ",
+    "FF" = "CAST/EiJ",
+    "GG" = "PWK/PhJ",
+    "HH" = "WSB/EiJ"
+)
+
+# Function to create correlation plots with haplotype coloring
+create_correlation_plot <- function(gene_data, pheno_data, haplo_data, gene_name, gene_symbol, pheno_name, output_dir) {
+    # Calculate bicor correlation and p-value
+    bicor_result <- bicorAndPvalue(as.matrix(gene_data), 
+                                as.matrix(pheno_data), 
+                                use = "pairwise.complete.obs",
+                                alternative = "two.sided")
+    
+    # Create data frame for plotting
+    plot_data <- data.frame(
+        gene_expr = gene_data,
+        pheno_val = pheno_data,
+        haplotype = haplo_data
+    )
+    
+    # Create the plot with haplotype coloring
+    plot <- ggplot(data = plot_data, 
+                  aes(x = gene_expr, y = pheno_val, color = haplotype)) +
+        geom_point(size = 3, alpha = 0.7) +
+        geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+        scale_color_manual(values = c(
+            "AA" = "#ff0",  # A/J
+            "BB" = "#888",  # C57BL/6J
+            "CC" = "#f88",  # 129S1/SvImJ
+            "DD" = "#11f",  # NOD/ShiLtJ
+            "EE" = "#0cf",  # NZO/HlLtJ
+            "FF" = "#0a0",  # CAST/EiJ
+            "GG" = "#f00",  # PWK/PhJ
+            "HH" = "#90e"   # WSB/EiJ
+        )) +
+        theme_bw() +
+        labs(
+            x = paste0(gene_symbol, " Expression"),
+            y = pheno_name,
+            title = paste0("Correlation of ", gene_symbol, " with ", pheno_name),
+            color = "Founder Strain"
+        ) +
+        theme(
+            plot.title = element_text(size = 12, face = "bold"),
+            axis.title = element_text(size = 10),
+            axis.text = element_text(size = 8),
+            legend.position = "right",
+            legend.title = element_text(size = 10),
+            legend.text = element_text(size = 8)
+        )
+    
+    # Add correlation coefficient and p-value to plot
+    plot <- plot + annotate(
+        "text",
+        x = min(gene_data),
+        y = max(pheno_data),
+        label = sprintf("bicor = %.3f\np = %.2e", 
+                       bicor_result$bicor[1,1],
+                       bicor_result$p[1,1]),
+        hjust = 0,
+        vjust = 1
+    )
+    
+    return(list(plot = plot, 
+                correlation = bicor_result$bicor[1,1], 
+                p_value = bicor_result$p[1,1]))
+}
+
+# Main analysis function
+run_correlation_analysis <- function(overlap_dir, Pheno_filtered, Master_haplo, output_dir) {
+    # Create output directory if it doesn't exist
+    dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    # Define phenotype mapping based on actual file names
+    pheno_mapping <- c(
+        "BF" = "BodyFatPercent8w",
+        "BodyWeight8w" = "BodyWeight8w",
+        "CHOL" = "CHOL2",
+        "GLUC3" = "GLUC3",
+        "HDL" = "HDLC4",
+        "Lean8w" = "Lean8w",
+        "TRIGL" = "TRIGL"
+    )
+    
+    # Get list of overlap files
+    overlap_files <- list.files(overlap_dir, pattern = "\\.rds$")
+    
+    # Create results list to store all correlations
+    all_results <- list()
+    
+    # Process each file
+    for (file in overlap_files) {
+        # Extract phenotype code from filename
+        pheno_code <- gsub("overlap_RIX2_(.+)_overlapping_genes\\.rds", "\\1", file)
+        pheno_column <- pheno_mapping[pheno_code]
+        
+        if (is.na(pheno_column)) {
+            warning(sprintf("No matching phenotype found for %s", file))
+            next
+        }
+        
+        # Read overlap data
+        overlap_data <- readRDS(file.path(overlap_dir, file))
+        
+        # Get sample columns (starting from column 15)
+        sample_cols <- colnames(overlap_data)[15:ncol(overlap_data)]
+        
+        # Verify sample columns exist in phenotype data
+        common_samples <- intersect(sample_cols, Pheno_filtered$Animal.ID)
+        if (length(common_samples) == 0) {
+            warning(sprintf("No matching samples found in file %s", file))
+            next
+        }
+        
+        # Process each gene
+        for (gene in unique(overlap_data$Gene)) {
+            # Get row for current gene
+            gene_row <- overlap_data[overlap_data$Gene == gene, ]
+            
+            # Get gene symbol from external_gene_name.x column
+            gene_symbol <- gene_row$external_gene_name.x[1]
+            
+            # Extract expression values for common samples
+            gene_expr <- as.numeric(unlist(gene_row[1, common_samples]))
+            
+            # Get corresponding phenotype data
+            pheno_vals <- Pheno_filtered[match(common_samples, Pheno_filtered$Animal.ID), pheno_column]
+            
+            # Get corresponding haplotype data
+            haplo_vals <- Master_haplo[gene, common_samples]
+            
+            # Remove NA values
+            valid_idx <- !is.na(gene_expr) & !is.na(pheno_vals) & !is.na(haplo_vals)
+            if (sum(valid_idx) < 3) {
+                warning(sprintf("Too few valid pairs for gene %s in %s", gene_symbol, file))
+                next
+            }
+            
+            # Create correlation plot with haplotype information
+            result <- create_correlation_plot(
+                gene_expr[valid_idx],
+                pheno_vals[valid_idx],
+                haplo_vals[valid_idx],
+                gene,
+                gene_symbol,
+                pheno_column,
+                output_dir
+            )
+            
+            # Save plot as PNG using gene symbol in filename
+            plot_file <- file.path(output_dir, 
+                                sprintf("%s_%s_correlation.png", gene_symbol, pheno_code))
+            ggsave(plot_file, result$plot, width = 10, height = 8, dpi = 300)
+            
+            # Store results
+            all_results[[length(all_results) + 1]] <- data.frame(
+                Gene = gene,
+                Gene_Symbol = gene_symbol,
+                Phenotype = pheno_column,
+                Bicor = result$correlation,
+                P_value = result$p_value
+            )
+        }
+    }
+    
+    # Combine all results and save
+    results_df <- do.call(rbind, all_results)
+    write.csv(results_df, 
+              file.path(output_dir, "correlation_results.csv"), 
+              row.names = FALSE)
+    
+    return(results_df)
+}
+
+# Run the analysis with the haplotype information
+results <- run_correlation_analysis(overlap_dir, Pheno_filtered, Master_haplo, output_dir)
+
+# unfortunatly, none of these output graphs show a clear allele exp X pheno relationship 
+# need to regenerate these, and initial input files, after filtering the 40x19 TRIGL outlier sample -- likely why I have more DEIs correlated w TRIGL 
+```
+
+```{r}
+# RIX2 (83 diff haplo DEIs only)
+
+# Load required libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(WGCNA)
+
+# Keep the founder strain mapping
+founder_strains <- c(
+    "AA" = "A/J",
+    "BB" = "C57BL/6J",
+    "CC" = "129S1/SvImJ",
+    "DD" = "NOD/ShiLtJ",
+    "EE" = "NZO/HlLtJ",
+    "FF" = "CAST/EiJ",
+    "GG" = "PWK/PhJ",
+    "HH" = "WSB/EiJ"
+)
+
+create_correlation_plot <- function(gene_data, pheno_data, haplo_data, gene_name, pheno_name, output_dir) {
+    # Calculate bicor correlation and p-value
+    bicor_result <- bicorAndPvalue(gene_data, 
+                                pheno_data, 
+                                use = "pairwise.complete.obs",
+                                alternative = "two.sided")
+    
+    # Create data frame for plotting
+    plot_data <- data.frame(
+        gene_expr = gene_data,
+        pheno_val = pheno_data,
+        haplotype = haplo_data
+    )
+    
+    # Create the plot with haplotype coloring
+    plot <- ggplot(data = plot_data, 
+                  aes(x = gene_expr, y = pheno_val, color = haplotype)) +
+        geom_point(size = 3, alpha = 0.7) +
+        geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+        scale_color_manual(values = c(
+            "AA" = "#ff0",  # A/J
+            "BB" = "#888",  # C57BL/6J
+            "CC" = "#f88",  # 129S1/SvImJ
+            "DD" = "#11f",  # NOD/ShiLtJ
+            "EE" = "#0cf",  # NZO/HlLtJ
+            "FF" = "#0a0",  # CAST/EiJ
+            "GG" = "#f00",  # PWK/PhJ
+            "HH" = "#90e"   # WSB/EiJ
+        )) +
+        theme_bw() +
+        labs(
+            x = paste0(gene_name, " Expression"),
+            y = pheno_name,
+            title = paste0("Correlation of ", gene_name, " with ", pheno_name),
+            color = "Founder Strain"
+        ) +
+        theme(
+            plot.title = element_text(size = 12, face = "bold"),
+            axis.title = element_text(size = 10),
+            axis.text = element_text(size = 8),
+            legend.position = "right",
+            legend.title = element_text(size = 10),
+            legend.text = element_text(size = 8)
+        )
+    
+    # Add correlation coefficient and p-value to plot
+    plot <- plot + annotate(
+        "text",
+        x = min(gene_data),
+        y = max(pheno_data),
+        label = sprintf("bicor = %.3f\np = %.2e", 
+                       bicor_result$bicor[1,1],
+                       bicor_result$p[1,1]),
+        hjust = 0,
+        vjust = 1
+    )
+    
+    return(list(plot = plot, 
+                correlation = bicor_result$bicor[1,1], 
+                p_value = bicor_result$p[1,1]))
+}
+
+run_correlation_analysis <- function(RIX2_DEI_filtered, Pheno_filtered, Master_haplo_filtered, 
+                                   anno_filtered, pheno_columns, output_dir, p_value_threshold = 0.05) {
+    # First, ensure genes are in the same order
+    # Sort RIX2_DEI_filtered by Gene
+    RIX2_DEI_filtered <- RIX2_DEI_filtered[order(RIX2_DEI_filtered$Gene), ]
+    
+    # Sort Master_haplo_filtered to match RIX2_DEI_filtered
+    Master_haplo_filtered <- Master_haplo_filtered[order(rownames(Master_haplo_filtered)), ]
+    
+    # Verify the genes match
+    if(!all(RIX2_DEI_filtered$Gene == rownames(Master_haplo_filtered))) {
+        stop("Gene orders don't match after sorting. Please check gene IDs.")
+    }
+    
+    # Create output directory if it doesn't exist
+    dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    # Initialize results list
+    all_results <- list()
+    
+    # Get genes from the Gene column
+    genes <- RIX2_DEI_filtered$Gene
+    # Get sample columns (all columns except 'Gene')
+    sample_cols <- colnames(RIX2_DEI_filtered)[-1]
+    
+    cat(sprintf("Processing %d genes for %d phenotypes...\n", length(genes), length(pheno_columns)))
+    
+    # Process each gene and phenotype combination
+    for (i in seq_along(genes)) {
+        gene <- genes[i]
+        # Get external gene name from anno_filtered using correct column names
+        external_gene_name <- anno_filtered$external_gene_name[anno_filtered$ensembl_gene_id == gene]
+        
+        if(length(external_gene_name) == 0 || is.na(external_gene_name)) {
+            cat(sprintf("Warning: No external name found for %s\n", gene))
+            external_gene_name <- gene  # Use Ensembl ID if no external name found
+        }
+        
+        # Get expression data for current gene (excluding Gene column)
+        gene_expr <- as.numeric(as.character(RIX2_DEI_filtered[i, -1]))
+        names(gene_expr) <- sample_cols
+        
+        # Get haplotype data for current gene
+        haplo_vals <- as.character(unlist(Master_haplo_filtered[i, sample_cols]))
+        
+        for (pheno_col in pheno_columns) {
+            # Get phenotype values 
+            pheno_vals <- as.numeric(Pheno_filtered[[pheno_col]])
+            
+            # Debug print
+            cat(sprintf("\nTesting %s (%s) vs %s\n", gene, external_gene_name, pheno_col))
+            
+            # Remove NA values
+            valid_idx <- !is.na(gene_expr) & !is.na(pheno_vals) & !is.na(haplo_vals)
+            
+            if (sum(valid_idx) < 3) {
+                warning(sprintf("Too few valid pairs for gene %s and phenotype %s", external_gene_name, pheno_col))
+                next
+            }
+            
+            # Calculate correlation and print debug info
+            bicor_test <- bicorAndPvalue(gene_expr[valid_idx], 
+                                       pheno_vals[valid_idx], 
+                                       use = "pairwise.complete.obs",
+                                       alternative = "two.sided")
+            
+            cat(sprintf("Correlation: %.3f\n", bicor_test$bicor[1,1]))
+            cat(sprintf("P-value: %.3e\n", bicor_test$p[1,1]))
+            
+            # Only create plot if correlation is significant
+            if (bicor_test$p[1,1] < p_value_threshold) {
+                # Create correlation plot
+                result <- create_correlation_plot(
+                    gene_expr[valid_idx],
+                    pheno_vals[valid_idx],
+                    haplo_vals[valid_idx],
+                    external_gene_name,  # Use external name in plot
+                    pheno_col,
+                    output_dir
+                )
+                
+                # Save plot with new naming convention: Pheno_gene
+                plot_file <- file.path(output_dir, 
+                                    sprintf("%s_%s_correlation.png", pheno_col, external_gene_name))
+                ggsave(plot_file, result$plot, width = 10, height = 8, dpi = 300)
+                
+                # Store results
+                all_results[[length(all_results) + 1]] <- data.frame(
+                    Gene = gene,
+                    External_Gene_Name = external_gene_name,
+                    Phenotype = pheno_col,
+                    Bicor = result$correlation,
+                    P_value = result$p_value
+                )
+            }
+        }
+    }
+    
+    # Combine all results and save
+    if (length(all_results) > 0) {
+        results_df <- do.call(rbind, all_results)
+        write.csv(results_df, 
+                file.path(output_dir, "significant_correlation_results.csv"), 
+                row.names = FALSE)
+        
+        cat(sprintf("\nFound %d significant correlations (p < %f)\n", 
+                   nrow(results_df), p_value_threshold))
+        return(results_df)
+    } else {
+        cat("No significant correlations found\n")
+        return(NULL)
+    }
+}
+
+# Usage example:
+output_dir <- "./Results/DEI/Diff_haplo_DEIsXPheno/Plots"
+pheno_columns <- c("BodyFatPercent8w", "BodyWeight8w", "CHOL2", "GLUC3", "HDLC4", "Lean8w", "TRIGL")
+
+results <- run_correlation_analysis(
+    RIX2_DEI_filtered,
+    Pheno_filtered,
+    Master_haplo_filtered,
+    anno_filtered,  # Add this parameter
+    pheno_columns,
+    output_dir,
+    p_value_threshold = 0.05
+)
+
+# Note: some of these genes have exp values <1, hence -log values, which doesn't make biological sense. Likely need to filter counts a little more stringently. 
+# Also, after generating list of ASE_figs (ones that have clear alleleic effect) regenerate these graphs with the actual progenitor names instead of haplotype codes 
+```
+
+# 11. Graph specific genes - NA for now
+
+```{r}
+#Ex. Since Hectd2os gene is positively correlated w BF%, graph its expression levels for 01x19 vs 19x01 
+
+
+#### Note; this is phoebes code - I'm not ready to visualize at the gene level yet 
+
+### Get a subset of the expression data
+# Subset the annotation file
+FourGenes <- MainGenes[which(MainGenes$SYMBOL %in% c("Gpr75", "Sparc", "Dpp9", "Gipr")),]
+
+
+
+# Format expression data for adding gene name
+RMA.file1 <- UniqueTCid_rma
+RMA.file1$ProbeNum <- paste0("probe_", RMA.file1$probeset_id)
+
+# Add expression data
+FourGenes1 <- left_join(FourGenes, RMA.file1[c(2:125)])
+names(FourGenes1)
+
+# Set row names to be gene names and only keep expression data
+rownames(FourGenes1) <- FourGenes1$SYMBOL
+row.names(FourGenes1)
+
+# Transpose so that columns are genes
+FourGenes2 <- as.data.frame(t(FourGenes1[c(12:134)]))
+
+## Add strain and diet data
+# Add mouse sac ID column
+library(stringr)
+FourGenes2$MouseSac_ID1 <- unlist(str_extract_all(row.names(FourGenes2),"\\(?[0-9,.]+\\)?")) # get only numbers from the string
+
+# Remove periods and make sure the data type matches the data type from the Phenos df
+FourGenes2$MouseSac_ID <- as.integer(gsub("\\.", "", FourGenes2$MouseSac_ID1))
+
+# Add strain and diet
+FourGenes3 <- left_join(FourGenes2[c(1:5)], Phenos[c(1,3,6)])
+head(FourGenes3)
+names(FourGenes3)
+
+### Plot differences in expression by strain; change y as appropriate 
+p2 <- ggplot(FourGenes3, aes(x = CC_Strain, y = Sparc, fill = CC_Strain), 
+             alpha = 0.1) +
+  geom_boxplot(lwd=0.15, outlier.shape = NA) +
+  #scale_fill_manual(labels = c(FourGenes3$CC_Strain)) +
+    #values=c(DEStrainAnnoCol$fill), ) +
+  geom_point(position=position_jitterdodge(), size = 2, alpha = 0.3) +
+  #stat_summary(fun = median, fun.min = median, fun.max = median,
+  #               geom = "crossbar", width = 0.5)+
+  #scale_color_manual(values=c("#FFDC00","#888888","#F08080","#0064C9","#7FDBFF","#2ECC40","#FF4136","#B10DC9")) +
+  #xlab(NULL) +
+  #ylab(paste0(colnames(Module)[i]," (PC1)")) +
+  theme_bw() + 
+  theme(legend.position = "none",
+        panel.background = element_blank(),
+        axis.text.x = element_text(size=10, colour = "black", 
+                                   angle = 90, hjust = 1, vjust = 0.5),
+        axis.title.y=element_text(size=11, colour = "black"),
+        axis.text.y=element_text(size=10, colour = "black")) +
+  stat_compare_means(hide.ns = TRUE, label.y.npc = 0.97, label.x.npc = 0.07)
+p2
+ # Export at W=500,H=400
+
+
+### Plot differences in expression by diet
+my_comparisons <- list(c("H-Protein", "H-Sucrose"))
+symbol <- list(cutpoints = c(0, 0.00099, 0.0099, 0.0499, 0.099, 1), symbols = c("p<0.001", "p<0.01", "p<0.05", "p<0.10", "p>0.1"))
+p1 <- ggplot(FourGenes3, aes(x = Experimental_Diet, 
+                             y = Dpp9, fill = Experimental_Diet), alpha = 0.1) +
+  geom_boxplot(lwd=0.15, outlier.shape = NA) +
+  scale_fill_manual(values=c("#F8766D","#00BFC4"), labels = c("H-Protein", "H-Sucrose")) +
+  geom_point(position=position_jitterdodge(), size = 2, alpha = 0.3)+
+  #xlab(NULL) +
+  #ylab(paste0(colnames(Module)[i]," (PC1)")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        #panel.grid.major = element_blank(), 
+        #panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.text.x = element_text(size=14, colour = "black"),
+        axis.title.y=element_text(size=14, colour = "black"),
+        axis.text.y=element_text(size=12, colour = "black")
+        ) +
+  stat_compare_means(comparisons = my_comparisons, method = "wilcox.test", symnum.args = symbol) 
+p1
+
+# Export at W=300, H=350
+
+```
+
+### Extra: Fkbp5 Gene
+
+```{r}
+# Checking out Fkbp5 gene for Kevin Laugero, per Brian's request 
+# The FK506-binding protein 5 (FKBP5) gene is a key player in regulating cellular processes and stress responses
+
+# Load data files
+counts <- read.delim("/90daydata/do2_projects/Data4R/CCRIX/GRCm39_CCPups_redo_counts.txt", row.names = 1)
+colnames(counts) <- sub("^X", "", colnames(counts))
+
+# Load annotation and metadata
+anno <- read.delim("ensembl_mm_112.txt", as.is=TRUE)
+pup <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", 
+                 sheet = "Pups", 
+                 na.strings = c(""," ","NA","N/A","na", "n/a"), 
+                 skipEmptyRows = TRUE)
+ControlPup <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", 
+                       sheet = "ControlPups", 
+                       na.strings = c(""," ","NA","N/A","na", "n/a"), 
+                       skipEmptyRows = TRUE)
+
+# Combine pup data and create Cross column
+AllPups <- rbind(pup, ControlPup)
+AllPups$Cross <- paste0(AllPups$CC.Mom.Strain, "x", AllPups$CC.Dad.Strain)
+
+# Clean up diet names
+AllPups$Diet <- gsub("Low Protein", "LP", AllPups$Diet)
+AllPups$Diet <- gsub("AIN-93G", "AIN", AllPups$Diet)
+
+# Define dependent variables
+dependent_variables <- c("Lean4w", "BodyWeight4w", "BodyFatPercent4w",  
+                        "BodyWeight8w", "BodyFatPercent8w", "Lean8w",
+                        "ALB2", "ALTPL", "UREL", "GLUC3", "HDLC4", "TRIGL", "CHOL2")
+
+# Prepare metadata
+metadata_filtered <- AllPups %>%
+  select(Animal.ID, Sex, Diet, Cross, all_of(dependent_variables)) %>%
+  filter(Animal.ID %in% colnames(counts))
+
+# Filter counts to match metadata
+counts_filtered <- counts %>% 
+  select(all_of(metadata_filtered$Animal.ID))
+
+# Verify sample matching
+stopifnot(all(colnames(counts_filtered) == metadata_filtered$Animal.ID))
+
+# Add gene annotations
+counts_filtered$Gene <- rownames(counts_filtered)
+counts_filtered <- counts_filtered[, c("Gene", names(counts_filtered)[-ncol(counts_filtered)])]
+
+counts_annotated <- data.frame(
+  counts_filtered,
+  anno[match(counts_filtered$Gene, anno$Gene.stable.ID.version), ]
+)
+colnames(counts_annotated) <- sub("^X", "", colnames(counts_annotated))
+
+# Prepare count matrix for normalization
+# Extract only count columns (excluding Gene and annotation columns)
+count_cols <- setdiff(colnames(counts_annotated), 
+                     c("Gene", colnames(anno)))
+count_matrix <- as.matrix(counts_annotated[, count_cols])
+
+# Normalize with limma-voom
+d0 <- DGEList(count_matrix)
+d0 <- calcNormFactors(d0)
+keep <- filterByExpr(d0)
+d <- d0[keep,]
+v <- voom(d)
+
+# Create normalized counts data frame
+normalized_counts <- data.frame(Gene = counts_annotated$Gene[keep],
+                              v$E,
+                              counts_annotated[keep, setdiff(colnames(counts_annotated), 
+                                                           c(count_cols, "Gene"))])
+colnames(normalized_counts) <- sub("^X", "", colnames(normalized_counts))
+
+# The following objects are now ready for correlation analysis:
+# 1. normalized_counts - normalized expression data with annotations
+# 2. metadata_filtered - filtered metadata matching the samples
+# 3. dependent_variables - vector of phenotype variables for correlation
+```
+
+```{r}
+#Phenotype correlations -- AllPups x Sex (Males and Females only ## at bottom) AND by each Cross 
+
+# Function to prepare data with better sample matching
+prepare_data <- function(counts_df = normalized_counts, 
+                        metadata_df = metadata_filtered,
+                        gene = "Fkbp5",
+                        sex = NULL,
+                        cross = NULL,
+                        diet = NULL) {
+  # Filter metadata by sex if specified
+  if (!is.null(sex)) {
+    metadata_df <- metadata_df[metadata_df$Sex == sex, ]
+  }
+  
+   # Filter metadata by diet if specified
+  if (!is.null(diet)) {
+    metadata_df <- metadata_df[metadata_df$Diet == diet, ]
+  }
+  
+  
+  # Filter metadata by cross if specified
+  if (!is.null(cross)) {
+    metadata_df <- metadata_df[metadata_df$Cross == cross, ]
+  }
+  
+  # Extract Fkbp5 expression data
+  gene_data <- counts_df[counts_df$Gene.name == gene, ]
+  
+  if(nrow(gene_data) == 0) {
+    stop(paste("Gene", gene, "not found in the dataset"))
+  }
+  
+  # Get sample columns (excluding Gene.name and annotation columns)
+  sample_cols <- intersect(colnames(gene_data), metadata_df$Animal.ID)
+  
+  # Extract expression data
+  expression_data <- as.numeric(unlist(gene_data[, sample_cols]))
+  
+  # Create data frame with sample IDs and expression
+  expression_df <- data.frame(
+    Animal.ID = sample_cols,
+    Fkbp5 = expression_data
+  )
+  
+  # Merge with filtered metadata
+  merged_data <- merge(expression_df, metadata_df, 
+                      by = "Animal.ID", 
+                      all = FALSE)  # Only keep samples present in both datasets
+  
+  if(nrow(merged_data) == 0) {
+    stop("No matching samples found after filtering")
+  }
+  
+  return(merged_data)
+}
+
+# Function to analyze correlations with Fkbp5
+analyze_fkbp5_correlations <- function(counts_df = normalized_counts, 
+                                     metadata_df = metadata_filtered,
+                                     gene = "Fkbp5",
+                                     sex = NULL,
+                                     cross = NULL,
+                                     diet = NULL) {
+  # Prepare merged dataset
+  data <- prepare_data(counts_df, metadata_df, gene, sex, cross)
+  
+  # Create empty lists to store results
+  correlations <- list()
+  p_values <- list()
+  sample_sizes <- list()
+  
+  # Perform correlation tests for each phenotype
+  for(var in dependent_variables) {
+    # Get complete cases for this variable
+    complete_data <- complete.cases(data[, c("Fkbp5", var)])
+    n_samples <- sum(complete_data)
+    
+    if(n_samples >= 3) {  # Minimum sample size for correlation
+      test_result <- cor.test(data$Fkbp5[complete_data], 
+                            data[[var]][complete_data], 
+                            method = "spearman",
+                            exact = FALSE)  # Handle ties
+      
+      correlations[[var]] <- test_result$estimate
+      p_values[[var]] <- test_result$p.value
+      sample_sizes[[var]] <- n_samples
+    }
+  }
+  
+  # Create results data frame
+  results <- data.frame(
+    Phenotype = names(correlations),
+    Correlation = unlist(correlations),
+    P_value = unlist(p_values),
+    N = unlist(sample_sizes)
+  )
+  
+  # Add FDR-adjusted p-values
+  results$FDR_adjusted_p <- p.adjust(results$P_value, method = "BH")
+  
+  # Sort by absolute correlation value
+  results <- results[order(abs(results$Correlation), decreasing = TRUE), ]
+  
+  return(results)
+}
+
+
+# Function to create correlation visualization
+plot_correlations <- function(results) {
+  # Load required library
+  library(ggplot2)
+  
+  # Create bar plot
+  ggplot(results, aes(x = reorder(Phenotype, Correlation), y = Correlation)) +
+    geom_bar(stat = "identity", aes(fill = P_value < 0.05)) +
+    geom_text(aes(label = sprintf("%.3f", Correlation), 
+                  vjust = ifelse(Correlation >= 0, -0.5, 1.5)), size = 3) +
+    coord_flip() +
+    scale_fill_manual(values = c("grey", "skyblue"),
+                      name = "Significant\n(p < 0.05)") +
+    labs(title = "Correlations with Fkbp5 Expression",
+         x = "Phenotype",
+         y = "Pearson Correlation Coefficient") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 10))
+}
+
+# Update plotting function to handle normalized data
+plot_significant_correlations <- function(results_df,
+                                        p_threshold = 0.05) {
+  # Load required library
+  library(ggplot2)
+  
+  # Get normalized Fkbp5 data
+  fkbp5_data <- normalized_counts[normalized_counts$Gene.name == "Fkbp5", ]
+  
+  # Get expression values (all columns except annotations)
+  sample_cols <- colnames(fkbp5_data)[2:(ncol(fkbp5_data)-14)]
+  expression_data <- data.frame(
+    Animal.ID = sample_cols,
+    Fkbp5 = as.numeric(unlist(fkbp5_data[, sample_cols]))
+  )
+  
+  # Merge with metadata
+  plot_data <- merge(expression_data, metadata_filtered, by="Animal.ID")
+  
+  # Filter for significant correlations
+  sig_phenotypes <- results_df$Phenotype[results_df$P_value < p_threshold]
+  
+  # Create and print scatter plot for each significant correlation
+  for(phenotype in sig_phenotypes) {
+    # Get complete cases for this phenotype
+    complete_data <- complete.cases(plot_data[, c("Fkbp5", phenotype)])
+    current_data <- plot_data[complete_data, ]
+    
+    n_samples <- results_df$N[results_df$Phenotype == phenotype]
+    
+    p <- ggplot(current_data, aes_string(x = "Fkbp5", y = phenotype)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(method = "lm", color = "red") +
+      labs(title = paste("Fkbp5 vs", phenotype),
+           subtitle = sprintf("rho = %.3f, p = %.3e, n = %d", 
+                            results_df$Correlation[results_df$Phenotype == phenotype],
+                            results_df$P_value[results_df$Phenotype == phenotype],
+                            n_samples),
+           x = "Fkbp5 Expression (log2)",
+           y = phenotype) +
+      theme_minimal() +
+      theme(plot.title = element_text(size = 12, face = "bold"))
+    
+    print(p)
+  }
+  
+  if(length(sig_phenotypes) == 0) {
+    message("No significant correlations found.")
+  }
+}
+
+
+# Example usage:
+#AllPups
+results <- analyze_fkbp5_correlations()
+plot_correlations(results)
+plot_significant_correlations(results)
+
+#AllPups Males
+results_males <- analyze_fkbp5_correlations(sex = "male")
+plot_correlations(results_males)
+plot_significant_correlations(results_males)
+
+#AllPups Females 
+results_females <- analyze_fkbp5_correlations(sex = "female")
+plot_correlations(results_females)
+plot_significant_correlations(results_females)
+
+#AllPups AIN
+results_AIN <- analyze_fkbp5_correlations(diet = "AIN")
+plot_correlations(results_AIN)
+plot_significant_correlations(results_AIN)
+
+#AllPups LP
+results_LP <- analyze_fkbp5_correlations(diet = "LP")
+plot_correlations(results_LP)
+plot_significant_correlations(results_LP)
+
+#CC001xCC001
+results_01x01 <- analyze_fkbp5_correlations(cross = "CC001xCC001")
+plot_correlations(results_01x01)
+plot_significant_correlations(results_01x01)
+
+#CC019xCC019
+results_19x19 <- analyze_fkbp5_correlations(cross = "CC019xCC019")
+plot_correlations(results_19x19)
+plot_significant_correlations(results_19x19)
+
+#CC040xCC040
+results_40x40 <- analyze_fkbp5_correlations(cross = "CC040xCC040")
+plot_correlations(results_40x40)
+plot_significant_correlations(results_40x40)
+
+#CC001xCC019
+results_01x19 <- analyze_fkbp5_correlations(cross = "CC001xCC019")
+plot_correlations(results_01x19)
+plot_significant_correlations(results_01x19)
+
+#CC019xCC001
+results_19x01 <- analyze_fkbp5_correlations(cross = "CC019xCC001")
+plot_correlations(results_19x01)
+plot_significant_correlations(results_19x01)
+
+#CC019xCC040
+results_19x40 <- analyze_fkbp5_correlations(cross = "CC019xCC040")
+plot_correlations(results_19x40)
+plot_significant_correlations(results_19x40)
+
+#CC040xCC019
+results_40x19 <- analyze_fkbp5_correlations(cross = "CC040xCC019")
+plot_correlations(results_40x19)
+plot_significant_correlations(results_40x19)
+
+#CC001xCC040
+results_01x40 <- analyze_fkbp5_correlations(cross = "CC001xCC040")
+plot_correlations(results_01x40)
+plot_significant_correlations(results_01x40)
+
+#CC040xCC001
+results_40x01 <- analyze_fkbp5_correlations(cross = "CC040xCC001")
+plot_correlations(results_40x01)
+plot_significant_correlations(results_40x01)
+```

@@ -1,0 +1,167 @@
+---
+title: "AllPups_DE_analysis"
+output: html_document
+date: "2024-09-20"
+---
+
+**Load Packages**
+
+```{r}
+# Clear environment to start fresh (if necessary)
+rm(list = ls())
+
+library(openxlsx)
+library(BiocManager)
+library(edgeR)
+library(topGO)
+library(clusterProfiler)
+library(dplyr)
+library(Rgraphviz)
+library(org.Mm.eg.db)
+library(gplots)
+library(RColorBrewer)
+library(ggplot2)
+library(devtools)
+#devtools::install_github("javadnoorb/pathview")
+```
+
+**Read count table**
+
+```{r}
+counts <- read.delim("GRCm39_CCPups_redo_counts.txt", row.names = 1)
+
+#Note: R automatically added an X to the beginning of each of my numeric sample names, so I’m removing the X to have normal sample name (ex. 60C) – may introduce errors later on. 
+
+colnames(counts) <- sub("^X", "", colnames(counts))
+head(counts)
+```
+
+**Read in annotation**
+
+```{r}
+anno <- read.delim("ensembl_mm_112.txt",as.is=T)
+#dim(anno)
+```
+
+**Derive experiment metadata**
+
+```{r}
+#Note: I needed to create a custom code to import the cross/sex/maternal diet metadata. Also, I should have all 246 samples 
+
+# Load in Excel file and read the "pups" sheet
+pup <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", sheet = "Pups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+ControlPup <- read.xlsx("Data4R_db_03042024_FINAL.xlsx", sheet = "ControlPups", na.strings = c(""," ","NA","N/A","na", "n/a"), skipEmptyRows = TRUE)
+
+# Combine all pup data into one df
+AllPups <- rbind(pup, ControlPup)
+
+# Add Cross column 
+AllPups$Cross <- paste0(AllPups$CC.Mom.Strain, "x", AllPups$CC.Dad.Strain)
+
+#Edit Low Protein to LP and AIN-93G to AIN (removing space/- since it messes up contrasts function)
+AllPups$Diet <- gsub("Low Protein", "LP", AllPups$Diet)
+AllPups$Diet <- gsub("AIN-93G", "AIN", AllPups$Diet)
+
+# Select only the required columns
+metadata_subset <- AllPups %>%  select(`Animal.ID`, Sex, Diet, Cross)
+
+# Get the sample names from the counts data
+sample_names <- colnames(counts)
+
+# Filter the metadata to include only the samples present in the counts data
+metadata_filtered <- metadata_subset %>%  filter(`Animal.ID` %in% sample_names)
+
+# Get the sample names from the metadata subset
+metadata_samples <- metadata_filtered$`Animal.ID`
+
+# Filter the counts data to only include the CCRIX samples
+sample_names <- as.character(metadata_samples)
+matching_columns <- intersect(sample_names, names(counts))
+counts_filtered <- counts %>% select(all_of(matching_columns))
+
+# Ensure that the column names in counts_filtered match the Animal ID in metadata_filtered
+all_samples_present <- all(colnames(counts_filtered) %in% metadata_filtered$`Animal.ID`)
+
+# Verify that the order matches
+all(colnames(counts_filtered) == metadata_filtered$`Animal.ID`)
+
+# If the above returns TRUE, your metadata and counts are now correctly ordered and matched
+
+#Final files = counts_filtered and metadata_filtered
+```
+
+# Differential Gene Expression
+
+```{r}
+# Diet Effect Analysis by Cross
+
+# Function to analyze diet effect for a specific cross
+analyze_diet_effect <- function(cross_name, metadata_filtered, counts_filtered) {
+   
+   # 1. Subset to specific cross
+   relevant_samples <- metadata_filtered$Cross == cross_name
+   metadata_subset <- metadata_filtered[relevant_samples,]
+   counts_subset <- counts_filtered[,relevant_samples]
+   
+   # Verify subsetting
+   stopifnot(all(colnames(counts_subset) == metadata_subset$Animal.ID))
+   cat("\n=== Analysis for", cross_name, "===\n")
+   cat("Total samples:", nrow(metadata_subset), "\n")
+   cat("Samples per diet:\n")
+   print(table(metadata_subset$Diet))
+   
+   # 2. Set up model matrix
+   Diet = metadata_subset$Diet
+   Sex = metadata_subset$Sex
+   mm <- model.matrix(~0 + Diet + Sex, data = metadata_subset)
+   
+   # 3. DGE analysis pipeline
+   d0 <- DGEList(counts_subset)
+   d0 <- calcNormFactors(d0)
+   keep <- filterByExpr(d0, mm)
+   cat("Number of genes retained:", sum(keep), "\n")
+   d <- d0[keep,]
+   
+   # 4. Voom and model fitting
+   y <- voom(d, mm, plot = F)
+   fit <- lmFit(y, mm)
+   
+   # 5. Contrast and testing
+   contr <- makeContrasts(DietAIN - DietLP, 
+                         levels = colnames(coef(fit)))
+   tmp <- contrasts.fit(fit, contr)
+   tmp <- eBayes(tmp)
+   
+   # 6. Get results
+   top.table <- topTable(tmp, coef = 1, sort.by = "P", n = Inf)
+   deg_count <- sum(top.table$adj.P.Val < 0.05)
+   cat("Number of DEGs (FDR < 0.05):", deg_count, "\n")
+   
+   return(list(DEGs = deg_count, results = top.table))
+}
+
+# Get unique crosses
+crosses <- unique(metadata_filtered$Cross)
+
+# Run analysis for each cross
+all_results <- list()
+for(cross in crosses) {
+   all_results[[cross]] <- analyze_diet_effect(cross, metadata_filtered, counts_filtered)
+}
+
+# Print summary of all results
+cat("\n=== Summary of Diet Effects ===\n")
+for(cross in crosses) {
+   cat(sprintf("%s: %d DEGs\n", cross, all_results[[cross]]$DEGs))
+}
+
+# Optionally save detailed results for each cross
+#for(cross in crosses) {
+#    write.table(all_results[[cross]]$results,
+#                file = paste0("Diet_effect_", cross, ".txt"),
+#                row.names = F, sep = "\t", quote = F)
+#}
+
+# 0 Diet DEGs in ANY of my Control/CCRIX crosses 
+```
