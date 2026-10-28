@@ -1,76 +1,41 @@
 # 3_STAR_Alignment
 
-STAR-based read alignment to a reference genome, followed by read count matrix construction for downstream DE analysis.
+STAR alignment to the reference genome, the gene count matrix, and the checks on it. `./run.sh all` runs every step;
+each step also has its own `run.sh` name (below).
 
 ## Scripts
 
 ### `1_star_index.slurm`
-Builds the STAR genome index (run once per reference genome).
+Builds the STAR genome index once per reference and read length (`./run.sh index`), or verifies an existing one.
 
-- **Input:** GRCm39 genome FASTA + GENCODE M35 GTF annotation
-- **Output:** `References/star.overlap100.gencode.M35/` index directory
-- **Usage:**
-  ```bash
-  mkdir -p slurmout
-  sbatch 1_star_index.slurm
-  ```
-- **Runtime:** ~1–2 hours, 8 cores, 128 GB RAM
+- **Input:** the genome FASTA and GTF in `REF_DIR` (`./run.sh references`; GENCODE mouse M35 by default)
+- **Output:** `REF_DIR/star.overlap<N>.<reference>/` with `index_manifest.json` (reference hashes, STAR version,
+  overhang)
+- **Runtime:** about 1 hour for mouse or human, 16 cores, 128 GB RAM
 
 ---
 
 ### `2_star.slurm`
-SLURM array job — aligns each sample's trimmed reads to the STAR index.
+Slurm array job: aligns each sample's trimmed reads (`./run.sh star`).
 
-- **Input:** `01-HTS_Preproc/<sample>/` trimmed FASTQs; `samples.txt`
-- **Output:** `02-STAR_alignment/<sample>/` — BAM files + `*_ReadsPerGene.out.tab` count tables
-- **Usage:**
-  ```bash
-  # Edit --array=1-N to match number of samples
-  sbatch 2_star.slurm
-  ```
+- **Input:** `01-HTS_Preproc/<sample>/` trimmed reads; `samples.txt`
+- **Output:** `02-STAR_alignment/<sample>/`: sorted BAM and `*_ReadsPerGene.out.tab` count tables
 
 ---
 
 ### `3_star_stats.sh`
-Summarizes alignment statistics across all samples into a single tab-separated table.
+Summarizes alignment statistics across all samples (`./run.sh stats`).
 
-- **Input:** `02-STAR_alignment/*/` (all STAR output directories)
-- **Output:** `summary_star_alignments.txt`
-- **Usage:**
-  ```bash
-  bash 3_star_stats.sh
-  ```
+- **Output:** `summary_star_alignments.txt` and `strandedness.tsv` (which count column fits the library)
 
 ---
 
 ### `4_reads2counts.sh`
-Aggregates per-sample `ReadsPerGene.out.tab` files into a single gene × sample count matrix.
+Builds the gene × sample count matrix from the `ReadsPerGene.out.tab` files (`./run.sh counts`).
 
-- **Input:** `02-STAR_alignment/` (STAR output)
-- **Output:** `03-Counts/` directory with count matrix
-- **Usage:**
-  ```bash
-  bash 4_reads2counts.sh
-  ```
+- **Output:** `03-Counts/counts.txt`
 
----
-
-### `5_confirm_reads2counts.py`
-Validates the count matrix by cross-checking totals between the STAR output and the merged count file.
-
-- **Usage:**
-  ```bash
-  python3 5_confirm_reads2counts.py
-  ```
-
-## Expected Output Structure
-
-```
-02-STAR_alignment/
-├── Sample1/
-│   ├── Sample1_Aligned.sortedByCoord.out.bam
-│   └── Sample1_ReadsPerGene.out.tab
-03-Counts/
-└── <prefix>_counts.txt    # gene × sample count matrix
-summary_star_alignments.txt
-```
+### `5_confirm_reads2counts.py`, `6_compare_to_published.py`, `7_finalize.slurm`
+Check every count cell against its STAR table (`confirm`), compare with an earlier count table (`compare`), and run
+the final statistics, counts, checks, `mapping_qc.tsv` and BAM indexes as one job (`finalize`, the last step of
+`all`).

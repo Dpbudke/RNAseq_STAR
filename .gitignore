@@ -1,0 +1,6 @@
+/tools/
+/run_settings.sh
+/work/
+__pycache__/
+*.pyc
+.venv/

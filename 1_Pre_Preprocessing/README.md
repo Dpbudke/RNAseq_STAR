@@ -1,43 +1,28 @@
 # 1_Pre_Preprocessing
 
-Merges multi-lane FASTQs into per-sample files and organizes them into individual directories before QC.
+Lists the samples and combines each sample's sequencing lanes into one FASTQ per read before QC. `run.sh` runs both
+steps (`./run.sh samples`, `./run.sh concat`, or `./run.sh all`).
 
 ## Scripts
 
-### `1_concatenate_rnaseq.sh`
-Concatenates R1 and R2 reads from two sequencing lanes into a single file per read per sample.
+### `1_make_samples_txt.sh`
+Finds every sample in every lane directory by its full file name and records the exact input files.
 
-- **Input:** Two lane directories containing `*_L008_R{1,2}_001.fastq.gz` and `*_L004_R{1,2}_001.fastq.gz`
-- **Output:** `concatenated_reads/<sample>_R{1,2}_concatenated.fastq.gz`
-- **Usage:** Edit `LANE1_DIR`, `LANE2_DIR`, and `OUTPUT_DIR` at the top of the script, then run:
-  ```bash
-  bash 1_concatenate_rnaseq.sh
-  ```
+- **Input:** `LANE_DIRS` (one directory per lane) with `<sample>_S<n>_L<lane>_R1_001.fastq.gz` and, for paired-end
+  runs, the matching `R2`; `SAMPLE_NAME_STYLE` sets how a file name becomes a sample name (`./run.sh scan` shows it)
+- **Output:** `samples.txt` (one sample per line) and `input_manifest.tsv` (every sample's file in every lane, with
+  its size)
+- **Checks:** every lane holds the same samples, each with all its reads; names that begin other names (`MOUSE_1`,
+  `MOUSE_10`) keep their own files; `EXPECTED_SAMPLES_FILE`, when set, must list exactly the samples found
 
-### `2_organize_samples.sh`
-Moves concatenated FASTQ pairs into per-sample subdirectories.
+### `2_concatenate_rnaseq.slurm`
+Slurm array job, one task per sample: joins that sample's lane files listed in `input_manifest.tsv`.
 
-- **Input:** `*_R1_concatenated.fastq.gz` / `*_R2_concatenated.fastq.gz` in current directory
-- **Output:** `<sample>/` directories each containing the R1 and R2 files
-- **Usage:**
-  ```bash
-  cd concatenated_reads
-  bash ../2_organize_samples.sh
-  ```
+- **Output:** `concatenated_reads/<sample>/<sample>_R1_concatenated.fastq.gz` (and `_R2_` for paired-end runs)
+- **Checks:** each joined file decompresses cleanly and holds whole FASTQ records; R1 and R2 hold the same number of
+  reads
 
-> **After running:** move `2_organize_samples.sh` out of `concatenated_reads/` back to the base directory (e.g. `CCPups/`) before generating `samples.txt`, so the script filename doesn't appear as a sample name.
-
-### Generating `samples.txt`
-
-`samples.txt` (one sample name per line) is required by the HTStream and STAR SLURM array jobs. Generate it from inside `concatenated_reads/` after organizing:
-
-```bash
-cd concatenated_reads
-ls > ../samples.txt
-cat ../samples.txt   # verify contents look correct
-```
-
-## Expected Output Structure
+## Expected output structure
 
 ```
 concatenated_reads/

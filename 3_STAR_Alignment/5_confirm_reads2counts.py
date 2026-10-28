@@ -1,159 +1,76 @@
 #!/usr/bin/env python3
+"""Compare every matrix cell with its STAR table using the selected count column."""
+import argparse
+from array import array
+import csv
+import hashlib
+import json
+from pathlib import Path
 
-import os
-import pandas as pd
-import numpy as np
 
-def read_readspergene(file_path):
-    """
-    Read a STAR ReadsPerGene.out.tab file and return a Series with gene counts
-    Skip exactly 4 lines (matching tail -n +5) and use the 1st and 4th columns
-    """
-    # Read the file, skipping exactly 4 rows (matching tail -n +5)
-    df = pd.read_csv(file_path, sep='\t', skiprows=4, header=None, names=['gene_id', 'col2', 'col3', 'count'])
-    # Create a Series with gene IDs as index and counts as values
-    return pd.Series(data=df['count'].values, index=df['gene_id'].values, name=os.path.basename(os.path.dirname(file_path)))
+def compare_counts(star_dir, counts_file, samples_file, column):
+    if column not in (2, 3, 4):
+        raise ValueError('Count column must be 2, 3, or 4')
+    samples = Path(samples_file).read_text().splitlines()
+    if not samples or any(not s for s in samples) or len(samples) != len(set(samples)):
+        raise ValueError('Sample list is empty or contains duplicates')
+    dirs = {p.name for p in Path(star_dir).iterdir() if p.is_dir()}
+    if dirs != set(samples):
+        raise ValueError(f'STAR sample coverage differs: missing={set(samples)-dirs}, extra={dirs-set(samples)}')
+    genes, seen = [], set()
+    columns = [array('q') for _ in samples]
+    with Path(counts_file).open() as f:
+        rows = csv.reader(f, delimiter='\t')
+        if next(rows, None) != ['gene_id', *samples]:
+            raise ValueError('Matrix sample names or order differ from samples.txt')
+        for row in rows:
+            if len(row) != len(samples)+1 or not row[0] or row[0] in seen:
+                raise ValueError('Invalid row length or duplicate gene in matrix')
+            genes.append(row[0]); seen.add(row[0])
+            for dest, count in zip(columns, row[1:]):
+                if not count.isdecimal():
+                    raise ValueError('Matrix counts must be nonnegative integers')
+                dest.append(int(count))
+    if not genes:
+        raise ValueError('Matrix has no genes')
+    sums = {}
+    for sample, counts in zip(samples, columns):
+        path = Path(star_dir)/sample/(sample+'_ReadsPerGene.out.tab')
+        with path.open() as f:
+            rows = csv.reader(f, delimiter='\t')
+            for label in ['N_unmapped', 'N_multimapping', 'N_noFeature', 'N_ambiguous']:
+                row = next(rows, [])
+                if len(row) != 4 or row[0] != label:
+                    raise ValueError(f'Invalid STAR summary rows: {sample}')
+            n = 0
+            for n, row in enumerate(rows, 1):
+                if n > len(genes) or len(row) != 4 or row[0] != genes[n-1]:
+                    raise ValueError(f'STAR gene order or coverage differs: {sample}')
+                if not row[column-1].isdecimal() or int(row[column-1]) != counts[n-1]:
+                    raise ValueError(f'Count differs: {sample}, {row[0]}')
+            if n != len(genes):
+                raise ValueError(f'STAR table is incomplete: {sample}')
+        sums[sample] = sum(counts)
+    with Path(counts_file).open('rb') as f:
+        digest = hashlib.file_digest(f, 'sha256').hexdigest()
+    return {'status':'passed', 'samples':len(samples), 'genes':len(genes),
+            'cells_compared':len(samples)*len(genes), 'count_column':column,
+            'sample_totals':sums, 'matrix_sha256':digest}
 
-def compare_counts(star_dir, counts_file):
-    """
-    Compare individual STAR count files with the consolidated counts table
-    Follows the exact same process used in the bash script that generated the counts
-    """
-    # Read the consolidated counts table
-    counts_df = pd.read_csv(counts_file, sep='\t', index_col=0)
-    
-    # Dictionary to store results
-    results = {}
-    
-    # Get all sample directories
-    sample_dirs = [d for d in os.listdir(star_dir) 
-                  if os.path.isdir(os.path.join(star_dir, d))]
-    sample_dirs.sort()  # Sort for consistent output
-    
-    print(f"\nChecking {len(sample_dirs)} samples...")
-    
-    # Check if all samples in the counts table are present in the directories
-    missing_samples = set(counts_df.columns) - set(sample_dirs)
-    extra_samples = set(sample_dirs) - set(counts_df.columns)
-    
-    if missing_samples:
-        print(f"\nWARNING: The following samples are in the counts table but not in {star_dir}:")
-        print(", ".join(sorted(missing_samples)))
-    
-    if extra_samples:
-        print(f"\nWARNING: The following samples are in {star_dir} but not in the counts table:")
-        print(", ".join(sorted(extra_samples)))
-    
-    # Only process samples that exist in both places
-    samples_to_check = set(counts_df.columns) & set(sample_dirs)
-    
-    for sample in sorted(samples_to_check):
-        print(f"\nChecking sample: {sample}")
-        # Construct path to ReadsPerGene file
-        readspergene_file = os.path.join(star_dir, sample, f"{sample}_ReadsPerGene.out.tab")
-        
-        if not os.path.exists(readspergene_file):
-            results[sample] = {
-                'status': 'ERROR',
-                'message': f'File not found: {readspergene_file}'
-            }
-            continue
-            
-        try:
-            # Read individual STAR counts - only the 4th column after skipping 4 lines
-            star_counts = read_readspergene(readspergene_file)
-            
-            # Get corresponding column from counts table
-            consolidated_counts = counts_df[sample]
-            
-            # Align the indices (genes) of both series
-            star_counts, consolidated_counts = star_counts.align(consolidated_counts, join='outer')
-            
-            # Compare the counts
-            matching = np.array_equal(
-                star_counts.fillna(-999).values,  # Use -999 as sentinel for missing values
-                consolidated_counts.fillna(-999).values
-            )
-            
-            # Calculate statistics
-            diff = star_counts - consolidated_counts
-            max_diff = diff.abs().max() if not diff.isna().all() else 0
-            num_differences = (diff != 0).sum()
-            
-            # Store detailed results
-            results[sample] = {
-                'status': 'PASS' if matching else 'FAIL',
-                'matching': matching,
-                'num_differences': num_differences,
-                'max_difference': max_diff,
-                'missing_in_star': consolidated_counts.index[consolidated_counts.notna() & star_counts.isna()].tolist(),
-                'missing_in_counts': star_counts.index[star_counts.notna() & consolidated_counts.isna()].tolist(),
-                'first_few_diffs': [] if matching else [
-                    (idx, star_counts[idx], consolidated_counts[idx])
-                    for idx in diff[diff != 0].head().index
-                ]
-            }
-            
-        except Exception as e:
-            results[sample] = {
-                'status': 'ERROR',
-                'message': str(e)
-            }
-    
-    return results
 
 def main():
-    # Define paths
-    star_dir = "02-STAR_alignment"
-    counts_file = "03-Counts/GRCm39_AFRI_counts.txt"
-    
-    if not os.path.exists(counts_file):
-        print(f"Error: Counts file not found: {counts_file}")
-        return
-        
-    if not os.path.exists(star_dir):
-        print(f"Error: STAR alignment directory not found: {star_dir}")
-        return
-    
-    # Run comparison
-    results = compare_counts(star_dir, counts_file)
-    
-    # Print results summary
-    print("\nQC Results Summary:")
-    print("-" * 50)
-    
-    # Count total passes/fails
-    total_samples = len(results)
-    passes = sum(1 for r in results.values() if r.get('status') == 'PASS')
-    fails = sum(1 for r in results.values() if r.get('status') == 'FAIL')
-    errors = sum(1 for r in results.values() if r.get('status') == 'ERROR')
-    
-    print(f"\nTotal samples checked: {total_samples}")
-    print(f"Passed: {passes}")
-    print(f"Failed: {fails}")
-    print(f"Errors: {errors}")
-    
-    # Print detailed results for non-passing samples
-    if fails > 0 or errors > 0:
-        print("\nDetailed results for non-passing samples:")
-        print("-" * 50)
-        for sample, result in results.items():
-            if result['status'] != 'PASS':
-                print(f"\nSample: {sample}")
-                if result['status'] == 'ERROR':
-                    print(f"Error: {result['message']}")
-                else:
-                    print(f"Status: {result['status']}")
-                    print(f"Number of differences: {result['num_differences']}")
-                    print(f"Maximum difference: {result['max_difference']}")
-                    if result['missing_in_star']:
-                        print(f"Genes missing in STAR counts: {len(result['missing_in_star'])}")
-                    if result['missing_in_counts']:
-                        print(f"Genes missing in consolidated counts: {len(result['missing_in_counts'])}")
-                    if result['first_few_diffs']:
-                        print("\nFirst few differences (Gene, STAR count, Consolidated count):")
-                        for gene, star_count, consolidated_count in result['first_few_diffs']:
-                            print(f"{gene}: {star_count} vs {consolidated_count}")
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--star-dir', type=Path, required=True)
+    p.add_argument('--counts', type=Path, required=True)
+    p.add_argument('--samples', type=Path, required=True)
+    p.add_argument('--column', type=int, choices=(2,3,4), required=True)
+    p.add_argument('--report', type=Path)
+    a = p.parse_args()
+    report = compare_counts(a.star_dir, a.counts, a.samples, a.column)
+    if a.report:
+        a.report.write_text(json.dumps(report, indent=2)+'\n')
+    print(f"Validated {report['cells_compared']} cells: {report['genes']} genes x {report['samples']} samples, STAR column {a.column}")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

@@ -1,0 +1,230 @@
+RNAseq_STAR setup
+
+1. PREPARE THE INPUTS
+
+   This workflow runs on Linux. It accepts paired-end or single-end FASTQ files
+   for mouse, human, any Ensembl species or your own genome, with one directory
+   per sequencing lane. It combines lanes for the same sample.
+
+   Before starting, obtain:
+   - Raw R1 (and, for paired-end, R2) FASTQs for every sample in every lane.
+   - The provider's checksum file in each lane directory, covering every FASTQ
+     (@md5Sum.md5 by default; SOURCE_MD5 names it, or none if there is none).
+   - A sample list or sample sheet to check the names against.
+   - Genome assembly, annotation release and library strand information.
+   - A writable output location with space for intermediate reads and BAMs.
+   - On Slurm: an account and partition you can use.
+
+   Keep raw files separate from outputs. Do not point WORKDIR at a raw directory.
+   For another study or repeat run, choose a new WORKDIR.
+
+2. COPY A CONFIGURATION
+
+   Log in to Ceres with a SCINet account. In Open OnDemand, choose Clusters >
+   Ceres Shell Access to open a terminal. An SSH connection also works.
+   Access instructions: https://scinet.usda.gov/guides/use/open-ondemand
+   Start in a writable project location, outside any raw lane or existing run.
+
+   Clone the repository:
+     git clone https://github.com/BJBennettlab/RNAseq_STAR.git
+     cd RNAseq_STAR
+
+   On Ceres:
+     cp examples/ceres.sh run_settings.sh
+
+   On another Linux system with software installed or an environment activated:
+     cp examples/linux.sh run_settings.sh
+
+   Edit the new file:
+     nano run_settings.sh
+
+   Nano: Ctrl+O, Enter saves; Ctrl+X exits. Open OnDemand's file editor also works.
+   The example paths must be replaced with real paths.
+
+   Required settings:
+   WORKDIR          Output directory for this run.
+   LANE_DIRS        One quoted raw directory per lane. Add or remove entries.
+   EXECUTOR         slurm or local. Local runs stages and samples in sequence.
+   SOFTWARE_MODE    modules or path. Path uses programs already on PATH.
+   SLURM_ACCOUNT    Your account; only used for Slurm.
+   SLURM_PARTITION  Your partition; only used for Slurm.
+   SLURM_MAIL       Your email, or "" for no email.
+
+   Ceres examples for finding available accounts and partitions:
+     sacctmgr -nP show assoc user=$USER format=Account | sort -u
+     scontrol show partition
+
+   Other useful settings:
+   SAMPLE_NAME_STYLE     illumina, first_field, or custom.
+   LIBRARY_LAYOUT        paired (default) or single.
+   SOURCE_MD5            Provider checksum file in each lane; default @md5Sum.md5, or none.
+   REFERENCE_SOURCE      gencode_mouse (default), gencode_human, ensembl or custom.
+   GENCODE_RELEASE       GENCODE release: M35 (mouse, default) or for example 47 (human).
+   ENSEMBL_SPECIES/ENSEMBL_RELEASE  For ensembl: for example rattus_norvegicus, 113.
+   CUSTOM_NAME/CUSTOM_GENOME_FA/CUSTOM_GTF  For custom: your own FASTA and GTF.
+   HTS_MIN_LENGTH        Shortest read kept after trimming; default 50.
+   HTS_DEDUP             yes (default, the lab's method) or no: HTStream duplicate removal.
+   REF_DIR               Optional shared reference directory. Otherwise in WORKDIR.
+   STAR_SJDB_OVERHANG    auto uses read length minus one; a number fixes it.
+   COUNT_COLUMN          auto, 2 (unstranded), 3 (forward), or 4 (reverse).
+   LOCAL_THREADS         STAR threads in local mode; default 8.
+   STAR_CPUS/STAR_MEMORY Slurm STAR resources; default 8 CPUs / 48G.
+   INDEX_CPUS/INDEX_MEMORY Slurm index resources; default 16 CPUs / 128G.
+
+   On Ceres, /90daydata is temporary working storage. Retain raw data and accepted
+   results in the project's persistent storage. Check project quota, not just df.
+   Group output uses umask 007. Set the output parent to the intended project
+   group with setgid so new files inherit that group.
+
+3. CHECK SOFTWARE AND REFERENCES
+
+   On Ceres, install the recorded STAR build in this repository copy:
+     python3 0_Setup/4_fetch_star.py
+
+   Ceres defaults use HTStream 1.3.3, Python 3.11.1 and SAMtools 1.17 modules.
+   The HTStream module's executables report version 1.3.2. The STAR download is
+   version 2.7.11b. docs/runtime.md lists identities and installation details.
+
+   For path mode, activate the required programs before running run.sh. The STAR
+   installer above also works on Linux x86_64 without modules. Other architectures
+   need compatible tool builds supplied by the user or site. Native macOS has
+   not been validated. Container execution (SOFTWARE_MODE=container) is described
+   in docs/runtime.md.
+
+   ./run.sh all downloads the chosen genome and annotation, verifies the
+   provider's checksums, prepares the rRNA reference and builds or verifies a STAR
+   index. Existing conflicting references or an incomplete index cause an error.
+   Reuse an index only when its reference hashes, STAR version and overhang match.
+
+   References/mouse_rrna.fasta is included. The genome and GTF are downloaded
+   during reference setup. Keep the chosen files for repeat runs of the study;
+   no routine update is needed. A different annotation release requires a new
+   reference directory, index and run. ensembl_mm_112.txt is a separate input for
+   the original R analyses and is not needed to produce STAR counts.
+
+   For 151 bp reads, auto sets overhang to 150. Set 100 only when the study's
+   reference setup requires it. Changing this can change count values.
+
+   The Python environment and package cache go under WORKDIR, not the home folder.
+   Initial reference/runtime/Python setup needs HTTPS access. On a cluster without
+   compute-node internet, prepare these in an allowed allocation or transfer a
+   verified environment/reference set before submitting processing stages.
+
+4. CHECK SAMPLE NAMES AND SETTINGS
+
+     ./run.sh scan
+     ./run.sh check
+     ./run.sh samples
+
+   For example:
+     STUDY_120_S23_L006_R1_001.fastq.gz -> STUDY_120  (illumina)
+     STUDY_120_S23_L006_R1_001.fastq.gz -> STUDY      (first_field, wrong here)
+
+   Read samples.txt and input_manifest.tsv in WORKDIR. Confirm that the names
+   match the sample sheet and every sample has exactly one R1/R2 pair per lane.
+   Undetermined is excluded from analysis but still checked against source MD5.
+   R1/R2 suffixes default to _R1_001.fastq.gz and _R2_001.fastq.gz; override
+   FASTQ_SUFFIX_R1/FASTQ_SUFFIX_R2 when the provider uses different suffixes.
+
+   Custom naming uses SAMPLE_NAME_STYLE="custom" and a sed -E expression in
+   SAMPLE_REGEX. Exact source files come from input_manifest.tsv, so a custom
+   sample name does not have to remain a prefix of the original filename.
+
+   check reports any FAIL lines, verifies software and writes resolved.sh in
+   WORKDIR. Stop and fix a FAIL before submitting. An optional EXPECTED_SAMPLES_FILE
+   path can require the observed names to match an approved text list.
+
+5. RUN
+
+   Preview all stages:
+     ./run.sh all --dry-run
+
+   Start:
+     ./run.sh all
+     ./run.sh status
+
+   Slurm mode records dependent jobs and returns after submission. Jobs continue
+   when the terminal disconnects. Local mode stays in the foreground; use a
+   persistent terminal session or an existing job supervisor for an overnight run.
+   Local HTStream uses several processes connected by pipes, even though samples
+   run one at a time. Allow enough CPU capacity and at least 48 GiB RAM for mouse
+   STAR work. Do not start local processing on a shared cluster login node.
+
+   Source files and the selected configuration are hashed before processing.
+   Later stages stop if those files change. Keep this pipeline copy unchanged
+   during a run. A separate PIPELINE_CONFIG environment variable can point at
+   another run_settings.sh instead of the file beside config.sh.
+
+   To run one stage at a time, wait for each submitted Slurm stage to complete
+   successfully before starting the next. Local commands wait for completion.
+
+     ./run.sh check
+     ./run.sh samples
+     ./run.sh record
+     ./run.sh references
+     ./run.sh pyenv
+     ./run.sh md5
+     ./run.sh concat
+     ./run.sh hts
+     ./run.sh index
+     ./run.sh star
+     ./run.sh finalize
+
+   references and pyenv may run independently. All MD5 tasks must pass before
+   concatenation. HTStream requires concatenation and the rRNA reference; STAR
+   requires HTStream outputs and the verified index.
+
+6. CHECK AND KEEP RESULTS
+
+     ./run.sh status
+     ./run.sh confirm      (a short Slurm job; output in WORKDIR/slurmout/)
+
+   Require all expected tasks to complete successfully. In WORKDIR, confirm:
+   - pipeline_state.txt says validated.
+   - count_validation.json says passed and covers all samples and genes.
+   - bam_validation.json says passed and covers all samples.
+   - QC tables contain every sample. Review unusual values with study context.
+
+   Full commands are in docs/validation.md. Empty .err files are normal; nonempty
+   stderr may contain either notices or errors. Use task exit codes and output
+   checks together. A finished queue alone does not prove the run succeeded.
+
+   Retain counts, BAMs/indexes if needed, STAR count tables/logs, QC reports,
+   samples/input_manifest, run_records, resolved.sh, job records and exact
+   reference files or their recorded downloads/hashes. Use checksums to verify
+   copies to permanent storage. Do not delete intermediates before acceptance.
+
+7. SEVERAL POOLS ON DIFFERENT LANES
+
+   Lanes inside one run must hold the same samples. When a study was sequenced
+   as separate pools (for example pool A on lanes 5 and 6, pool B on lanes 7
+   and 8), give each pool its own settings file and WORKDIR, and point REF_DIR
+   at one shared reference directory so both pools use the same index. Run each
+   pool through step 6, then join the validated tables:
+
+     python3 scripts/combine_runs.py /path/to/joined RUN_DIR_POOL_A RUN_DIR_POOL_B
+
+   It refuses runs that have not passed finalization, count tables changed after
+   validation, different gene lists or count columns, and a sample found in more
+   than one pool. The output holds counts.txt, samples.tsv and SHA256SUMS.txt.
+
+IF A STAGE FAILS
+
+   Read its full .out/.err logs and task record. Local logs start with local_.
+   all refuses an existing job record to prevent duplicate runs. After fixing the
+   cause, rerun only failed stages and any dependent stages that did not succeed.
+   Source/configuration changes require a fresh run directory or a documented
+   recovery with its earlier settings and outputs retained.
+
+   Missing FASTQs or different lane sample sets: correct the source directories.
+   Source MD5 failure: identify the file and check the provider's copy.
+   Reference mismatch: use a separate directory for the intended release/index.
+   Inconsistent auto strand choice: inspect strandedness.tsv and library records.
+   Do not force success by dropping samples or accepting only part of a matrix.
+
+DOWNSTREAM R ANALYSES
+
+   4_DE_Analysis holds the original study-specific analyses. It does not run as
+   part of all. See its README and docs/references.md for study metadata, gene
+   annotation exports such as ensembl_mm_112.txt, and missing historical inputs.
+   These inputs cannot be inferred safely from a new set of FASTQ filenames.

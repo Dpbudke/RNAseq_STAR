@@ -1,0 +1,33 @@
+# Software for the RNAseq_STAR container image (Dockerfile). The same versions as the Ceres runs: SAMtools 1.17 and
+# Python 3.11 with requirements.txt in the default environment; HTStream in its own environment, the exact build of
+# the Ceres htstream/1.3.3 module (bioconda h39f6147_2 with Boost 1.74 and Python 3.10). A newer build of the same
+# HTStream version (Boost 1.85) trimmed paired reads slightly differently (October 28, 2026 check). STAR is the
+# official 2.7.11b static binary, added by the Dockerfile with the checksum 0_Setup/4_fetch_star.py uses.
+[workspace]
+name = "rnaseq_star"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.11.*"
+samtools = "1.17.*"
+pigz = "*"
+coreutils = "*"
+gzip = "*"
+
+[pypi-dependencies]
+biopython = "==1.88"
+numpy = "==2.4.6"
+packaging = "==26.3"
+pandas = "==3.0.5"
+python-dateutil = "==2.9.0.post0"
+scipy = "==1.17.1"
+six = "==1.17.0"
+
+[feature.htstream.dependencies]
+htstream = { version = "==1.3.3", build = "h39f6147_2" }
+boost-cpp = "==1.74.0"
+python = "3.10.*"
+
+[environments]
+htstream = { features = ["htstream"], no-default-feature = true }

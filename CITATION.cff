@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use RNAseq_STAR, please cite it as below."
+title: "RNAseq_STAR: lane joining, HTStream preprocessing and STAR alignment with checked gene counts"
+authors:
+  - family-names: Budke
+    given-names: Dawson
+    affiliation: "Bennett Lab"
+repository-code: "https://github.com/BJBennettlab/RNAseq_STAR"
+type: software
